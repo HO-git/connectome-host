@@ -591,9 +591,9 @@ agents: [agentConfig],
     ...(recipe.codeExecution ? { codeExecution: recipe.codeExecution } : {}),
     ...(conversations ? { conversations } : {}),
     // Heartbeat / no-trigger speech goes to the recipe's home channel instead
-    // of the last-active channel. Spread untyped so an agent-framework older
-    // than the homeChannel option typechecks and simply ignores it.
-    ...(recipe.agent.homeChannel ? { homeChannel: recipe.agent.homeChannel } as object : {}),
+    // of the last-active channel (agent-framework#244). A framework without
+    // the option ignores the key.
+    ...(recipe.agent.homeChannel ? { homeChannel: recipe.agent.homeChannel } : {}),
     // Tune-out's subconscious resident (agent-framework#77) — recipe opt-in,
     // passed through verbatim; the framework owns the defaults.
     ...(recipe.subconscious ? { subconscious: recipe.subconscious } : {}),
