@@ -377,7 +377,8 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     const type = guarded(() => (err as { type?: unknown } | null)?.type);
     if (typeof type !== 'string' || !REQUEST_NOT_EVIDENCE.has(type)) return rawRequest;
     let bytes: number | null = null;
-    try { bytes = JSON.stringify(rawRequest).length; } catch { /* unserializable: no size */ }
+    // UTF-8 bytes, not UTF-16 code units: non-ASCII text would read smaller.
+    try { bytes = Buffer.byteLength(JSON.stringify(rawRequest), 'utf8'); } catch { /* unserializable: no size */ }
     return { omitted: `${type} error (set LLM_CALLS_FULL_PAYLOADS=1 to keep the request)`, bytes };
   }
 

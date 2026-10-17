@@ -11,6 +11,8 @@ import { AnthropicAdapter, rateLimitError, serverError, invalidRequestError } fr
 import { LoggingAnthropicAdapter } from '../src/logging-adapter.js';
 
 const BIG = { model: 'claude-fable-5', messages: [{ role: 'user', content: 'x'.repeat(200_000) }] };
+/** Multi-byte UTF-8 (CJK, accents, emoji): its byte size exceeds its string length. */
+const NON_ASCII = { model: 'claude-fable-5', messages: [{ role: 'user', content: '日本語のテキスト café 🙂'.repeat(5_000) }] };
 const proto = AnthropicAdapter.prototype as unknown as Record<'complete' | 'stream', unknown>;
 const original = { complete: proto.complete, stream: proto.stream };
 const logPath = join(tmpdir(), `llm-error-storm-${process.pid}.jsonl`);
@@ -22,11 +24,11 @@ afterEach(() => {
   rmSync(logPath, { force: true });
 });
 
-/** Make the underlying adapter capture BIG as its raw request, then fail. */
-function failWith(err: unknown): void {
+/** Make the underlying adapter capture `raw` as its raw request, then fail. */
+function failWith(err: unknown, raw: unknown = BIG): void {
   const fail = async (_req: unknown, a?: unknown, b?: unknown) => {
     const opts = (b ?? a) as { onRequest?: (r: unknown) => void } | undefined;
-    opts?.onRequest?.(BIG);
+    opts?.onRequest?.(raw);
     throw err;
   };
   proto.complete = fail;
@@ -51,6 +53,13 @@ for (const kind of ['complete', 'stream'] as const) {
     expect(JSON.stringify(rec).length).toBeLessThan(10_000);
   });
 }
+
+test('the size note counts UTF-8 bytes, not string length', async () => {
+  failWith(rateLimitError('429'), NON_ASCII);
+  const bytes = Buffer.byteLength(JSON.stringify(NON_ASCII), 'utf8');
+  expect(bytes).toBeGreaterThan(JSON.stringify(NON_ASCII).length);
+  expect((await lastErrorRecord('stream')).rawRequest).toMatchObject({ bytes });
+});
 
 test('server (overload) error records a size note', async () => {
   failWith(serverError('529 overloaded', 529));
