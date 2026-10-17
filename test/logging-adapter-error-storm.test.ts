@@ -3,7 +3,7 @@
  * request (rate limit, overload, network, auth) — those repeat across
  * retries — and keep it where the request is the evidence.
  */
-import { test, expect, afterEach } from 'bun:test';
+import { test, expect, beforeEach, afterEach } from 'bun:test';
 import { readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,11 +16,19 @@ const NON_ASCII = { model: 'claude-fable-5', messages: [{ role: 'user', content:
 const proto = AnthropicAdapter.prototype as unknown as Record<'complete' | 'stream', unknown>;
 const original = { complete: proto.complete, stream: proto.stream };
 const logPath = join(tmpdir(), `llm-error-storm-${process.pid}.jsonl`);
+const savedFullPayloads = process.env.LLM_CALLS_FULL_PAYLOADS;
+
+// The adapter reads the flag at construction: clear it before each test so a
+// run with LLM_CALLS_FULL_PAYLOADS=1 in the environment tests the default.
+beforeEach(() => {
+  delete process.env.LLM_CALLS_FULL_PAYLOADS;
+});
 
 afterEach(() => {
   proto.complete = original.complete;
   proto.stream = original.stream;
-  delete process.env.LLM_CALLS_FULL_PAYLOADS;
+  if (savedFullPayloads === undefined) delete process.env.LLM_CALLS_FULL_PAYLOADS;
+  else process.env.LLM_CALLS_FULL_PAYLOADS = savedFullPayloads;
   rmSync(logPath, { force: true });
 });
 
