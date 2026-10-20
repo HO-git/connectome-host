@@ -322,9 +322,11 @@ surgery and still uses its own branch stacks.
 ## Failure handling and observability
 
 - **Wire logs** — `llm-calls.<iso>.jsonl` per process (request summaries,
-  usage, timing, errors; raw requests on errors and refusals, or always with
+  usage, timing, errors; raw requests on refusals and errors, an error's only the first time its
+  log sees that request fail, or always with
   `LLM_CALLS_FULL_PAYLOADS=1`, which alone keeps a cache-keepalive poke's,
   each within the 16 MiB a line may take).
+  That first-time rule, with a hash and size for repeats, is the Anthropic writer's.
 - **Ops alerts** (agent-framework) — compression quarantine, refusal streaks,
   inference exhaustion, context refusals, GC closes: an `ops:alert` trace
   (shown as banners in both UIs), a record in `logs/failures.log`, and a

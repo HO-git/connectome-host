@@ -2,8 +2,8 @@
 // response, and any error to a JSONL log file. Restores the Hermes-era
 // `llm-calls.<iso>.jsonl` visibility we lose on the connectome stack by
 // default. Successful calls keep a compact request summary; the full raw
-// request is retained only for refusals and errors, where forensic inspection
-// matters (a keepalive poke's only with full payloads: see below). Serializing the full raw + normalized request on every tool-loop
+// request is retained only for refusals and for an error record the first
+// time this log sees that request fail, where forensic inspection matters (a keepalive poke's only with full payloads: see below). Serializing the full raw + normalized request on every tool-loop
 // turn previously created several simultaneous copies of a large context and
 // contributed to production OOMs.
 //
@@ -24,7 +24,7 @@
 // One file per process lifetime (timestamped at construction). Each line is a
 // JSON object with shape:
 //   { type: 'call'|'error', kind: 'complete'|'stream'|'keepalive', timestamp, durationMs,
-//     requestSummary, rawRequest?, rawResponse, error?, errorType?,
+//     requestSummary, rawRequest?, requestSha256?, rawRequestOmitted?, rawResponse, error?, errorType?,
 //     httpStatus?, providerErrorCode?, retryable?, errorChars?, truncated? }
 // A failure's `error` is { name, message, stack } with its text bounded, or
 // a non-Error's text (logging-error-fields.ts). The request summary leaves
@@ -49,10 +49,11 @@ import type {
   StreamCallbacks,
   KeepaliveCall,
 } from '@animalabs/membrane';
+import { createHash } from 'node:crypto';
 import { appendFileSync } from 'node:fs';
 import { parseLoggedCall, summarizeCacheControls, type ProviderCallRecord } from './call-ledger.js';
 import { describeErrorObject } from './logging-error-fields.js';
-import { serializeRecord } from './logging-record.js';
+import { serializeRecordReporting } from './logging-record.js';
 
 /** Live read of the current reasoning setting. The host wires this to
  *  `SettingsModule.getReasoning()` so toggles via the `agent_settings` tool's
@@ -100,9 +101,8 @@ export type ProviderCallObserver = (record: ProviderCallRecord) => void;
  *  system-prompt-append uses). */
 const OAUTH_SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/** Membrane error types whose cause is not in the request body: retries
- *  repeat them, so their records drop the raw request (see errorRawRequest). */
-const REQUEST_NOT_EVIDENCE = new Set(['rate_limit', 'server', 'network', 'timeout', 'abort', 'auth']);
+/** How many distinct failing requests an adapter remembers having written in full. */
+const FAILED_REQUESTS_REMEMBERED = 256;
 
 /** Calls `get`, giving undefined where it throws. */
 function guarded<T>(get: () => T): T | undefined {
@@ -303,11 +303,15 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
   private readonly warnedEffort = new Set<string>();
   private readonly warnedThinking = new Set<string>();
 
-  private log(record: Record<string, unknown>): void {
+  /** Appends the record's line; true when it was written whole, nothing dropped. */
+  private log(record: Record<string, unknown>): boolean {
     try {
-      appendFileSync(this.logPath, serializeRecord(record));
+      const { line, whole } = serializeRecordReporting(record);
+      appendFileSync(this.logPath, line);
+      return whole;
     } catch {
       // never throw from logging
+      return false;
     }
   }
 
@@ -486,21 +490,53 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     }
   }
 
-  /** Error records keep the full request only when the request itself is the
-   *  evidence. A rate-limit, overload, network or auth failure says nothing
-   *  about the request's contents, and those are exactly the errors that
-   *  repeat: one OAuth 429 storm wrote a ~4.4MB request per retry and grew a
-   *  single llm-calls file to 687MB. For those, keep a size note instead.
-   *  invalid_request / context_length / unsupported, non-membrane errors, and
-   *  LLM_CALLS_FULL_PAYLOADS=1 keep the request as before. */
-  private errorRawRequest(err: unknown, rawRequest: unknown): unknown {
-    if (this.fullPayloads || rawRequest == null) return rawRequest;
-    const type = guarded(() => (err as { type?: unknown } | null)?.type);
-    if (typeof type !== 'string' || !REQUEST_NOT_EVIDENCE.has(type)) return rawRequest;
-    let bytes: number | null = null;
+  /** The sha256 of each failing request this log has written in full, the
+   *  latest FAILED_REQUESTS_REMEMBERED of them, oldest first. Retries repeat
+   *  one request: one OAuth 429 storm wrote a ~4.4MB request per retry and
+   *  grew a single llm-calls file to 687MB. One log file per process, so a
+   *  remembered request's copy is always in this file. */
+  private readonly failedRequestsWritten = new Set<string>();
+
+  /** An error record's request fields. Whatever the error, the first record of
+   *  a failing request keeps it whole, since any failure, a 429 included (see
+   *  OAUTH_SYSTEM_IDENTITY), can be the request's doing. A later record of the
+   *  same request records its size in `rawRequestOmitted` instead. Both carry
+   *  `requestSha256`, so a repeat points at the copy written; `remember` is the
+   *  hash to note as written once its record is appended whole.
+   *  LLM_CALLS_FULL_PAYLOADS=1 keeps every copy. */
+  private errorRequestFields(rawRequest: unknown): { fields: Record<string, unknown>; remember?: string } {
+    if (rawRequest == null) return { fields: { rawRequest } };
+    let text: string | undefined;
+    try { text = JSON.stringify(rawRequest); } catch { /* unserializable: no hash */ }
+    if (typeof text !== 'string') return { fields: { rawRequest } };
+    const requestSha256 = createHash('sha256').update(text).digest('hex');
     // UTF-8 bytes, not UTF-16 code units: non-ASCII text would read smaller.
-    try { bytes = Buffer.byteLength(JSON.stringify(rawRequest), 'utf8'); } catch { /* unserializable: no size */ }
-    return { omitted: `${type} error (set LLM_CALLS_FULL_PAYLOADS=1 to keep the request)`, bytes };
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (this.fullPayloads || !this.failedRequestsWritten.has(requestSha256)) {
+      // Remembered only once its record is written whole: one the line bound
+      // cut has no copy for a later record to point at, so that one tries again.
+      return { fields: { rawRequest, requestSha256 }, remember: requestSha256 };
+    }
+    return {
+      fields: {
+        requestSha256,
+        rawRequestOmitted: {
+          bytes,
+          reason: 'an earlier error record in this log has this request in full (same requestSha256); '
+            + 'LLM_CALLS_FULL_PAYLOADS=1, read when the host starts, keeps every copy (within the 16 MiB line bound)',
+        },
+      },
+    };
+  }
+
+  /** Notes a failing request's hash as written, keeping the latest
+   *  FAILED_REQUESTS_REMEMBERED. */
+  private rememberFailedRequest(sha256: string): void {
+    this.failedRequestsWritten.delete(sha256);
+    this.failedRequestsWritten.add(sha256);
+    if (this.failedRequestsWritten.size > FAILED_REQUESTS_REMEMBERED) {
+      this.failedRequestsWritten.delete(this.failedRequestsWritten.values().next().value as string);
+    }
   }
 
   private refusalRawRequest(response: ProviderResponse, rawRequest: unknown): unknown {
@@ -548,9 +584,15 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       const durationMs = Date.now() - t0;
       // Read once, for the record and the ledger alike; reading never throws.
       const errorFields = 'error' in outcome ? describeErrorObject(outcome.error, true) : undefined;
+      // Membrane raises some errors, such as an unsupported prefill, before it
+      // calls onRequest, with the built request on the error itself.
+      if (rawRequest == null && 'error' in outcome) {
+        rawRequest = guarded(() => (outcome.error as { rawRequest?: unknown } | null)?.rawRequest) ?? null;
+      }
       const summary = this.requestSummary(request, rawRequest);
       const head = { type: errorFields ? 'error' : 'call', kind, timestamp, durationMs };
       let record: Record<string, unknown>;
+      let remember: string | undefined;
       try {
         record = 'response' in outcome
           ? {
@@ -559,11 +601,15 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
               rawRequest: this.refusalRawRequest(outcome.response, rawRequest),
               rawResponse: (outcome.response as { raw?: unknown }).raw ?? null,
             }
-          : { ...head, requestSummary: summary, rawRequest: this.errorRawRequest(outcome.error, rawRequest), ...errorFields };
+          : (() => {
+              const kept = this.errorRequestFields(rawRequest);
+              remember = kept.remember;
+              return { ...head, requestSummary: summary, ...kept.fields, ...errorFields };
+            })();
       } catch {
         record = { ...head, summaryUnavailable: true, ...errorFields };
       }
-      this.log(record);
+      if (this.log(record) && remember !== undefined) this.rememberFailedRequest(remember);
       try {
         const error = errorFields?.error;
         const errorText = error === undefined ? undefined

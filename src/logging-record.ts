@@ -98,8 +98,17 @@ function lastResort(record: Record<string, unknown>, unserializable: boolean): s
  * that keeps its raw response.
  */
 export function serializeRecord(record: Record<string, unknown>): string {
+  return serializeRecordReporting(record).line;
+}
+
+/** serializeRecord's line, and whether it is the whole record, nothing dropped. */
+export function serializeRecordReporting(record: Record<string, unknown>): { line: string; whole: boolean } {
   const whole = stringify(record);
-  if (whole !== undefined && fits(whole)) return whole + '\n';
+  if (whole !== undefined && fits(whole)) return { line: whole + '\n', whole: true };
+  return { line: serializeReduced(record, whole), whole: false };
+}
+
+function serializeReduced(record: Record<string, unknown>, whole: string | undefined): string {
   // A record with a raw response loses its raw request first, and the
   // response only when the line still doesn't fit: a request is the usual
   // oversized part, and the response holds the usage, cache writes and stop
