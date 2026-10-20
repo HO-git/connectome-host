@@ -1865,8 +1865,9 @@ export function validateRecipe(raw: unknown): Recipe {
     throw new Error('Recipe agent.maxStreamTokens must be a positive number.');
   }
 
-  if (agent.homeChannel !== undefined && (typeof agent.homeChannel !== 'string' || agent.homeChannel.trim().length === 0)) {
-    throw new Error('Recipe agent.homeChannel must be a non-empty channel id (e.g. "discord:{guildId}:{channelId}").');
+  // A channel id is matched exactly, so one with spaces around it would route nowhere: refuse it too.
+  if (agent.homeChannel !== undefined && (typeof agent.homeChannel !== 'string' || agent.homeChannel === '' || agent.homeChannel !== agent.homeChannel.trim())) {
+    throw new Error('Recipe agent.homeChannel must be a non-empty channel id with no spaces around it (e.g. "discord:{guildId}:{channelId}").');
   }
 
   // Recipes are runtime JSON; a typo'd TTL ("1hr", "60m") would otherwise

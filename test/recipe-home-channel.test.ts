@@ -35,10 +35,11 @@ describe('recipe agent.homeChannel', () => {
     expect(validateRecipe(recipeWithHomeChannel()).agent.homeChannel).toBeUndefined();
   });
 
-  test('rejects empty and non-string values at load time', () => {
-    expect(() => validateRecipe(recipeWithHomeChannel(''))).toThrow(/homeChannel/);
-    expect(() => validateRecipe(recipeWithHomeChannel('  '))).toThrow(/homeChannel/);
-    expect(() => validateRecipe(recipeWithHomeChannel(42))).toThrow(/homeChannel/);
+  test('rejects empty, padded and non-string values at load time', () => {
+    // Matched by the refusal's own words, so a TypeError past a missing guard can't stand in for it.
+    for (const bad of ['', '  ', 42, ' discord:123:456', 'discord:123:456 ']) {
+      expect(() => validateRecipe(recipeWithHomeChannel(bad))).toThrow(/agent\.homeChannel must be a non-empty channel id with no spaces around it/);
+    }
   });
 
   test('is a known agent key', () => {
