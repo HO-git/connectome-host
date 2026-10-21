@@ -787,8 +787,12 @@ blocks; expect folds to interact with this on the next model generation.
   adds the bounded error and its classification, and a call that got a response adds its summary
   (Bedrock, generic wrapper) or raw response (Anthropic, generic wrapper). A summary can be
   missing (`summaryUnavailable: true`, or dropped by the size cap below). Raw requests are kept
-  only where the writer's policy keeps them: Anthropic complete/stream on errors and refusals, or
-  on every call with `LLM_CALLS_FULL_PAYLOADS=1`; Anthropic keepalive pokes only with that opt-in,
+  only where the writer's policy keeps them: Anthropic complete/stream on refusals, and on the
+  first failure of each kind of error (its type and HTTP status, or for an untyped error its
+  name) in a run of failures on a cache lineage, until a call on it succeeds or an hour passes
+  with no failed call on it, keepalive pokes counting for neither (later failures of that kind carry `requestSha256` and the request's size under `rawRequestOmitted`; the
+  latest 256 lineages' runs are remembered; at most 64 MiB of such copies per log, for the life of the process), or on every call with
+  `LLM_CALLS_FULL_PAYLOADS=1`; Anthropic keepalive pokes only with that opt-in,
   whatever their outcome; Bedrock on errors; the generic wrapper on every call. Every line,
   newline included, is capped at 16 MiB of UTF-8: an oversized or unserializable record drops its
   raw request first, its raw response only if the line still doesn't fit, then its summaries, keeping at least its type, kind,

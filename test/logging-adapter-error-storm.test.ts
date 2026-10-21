@@ -1,14 +1,15 @@
 /**
- * An error record keeps the full request the first time its log sees that
- * request fail, whatever the error; a repeat (each retry of a
- * storm) records its hash and size instead, pointing at the copy written.
+ * An error record keeps the full request for the first failure of each kind
+ * (error type and HTTP status, or an untyped error's name) in a cache lineage's run of failures, within a
+ * budget per log; the run's later failures of that kind (each retry, each
+ * turn of a storm) record the request's hash and size instead.
  */
-import { test, expect, beforeEach, afterEach } from 'bun:test';
+import { test, expect, beforeEach, afterEach, setSystemTime } from 'bun:test';
 import { readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { AnthropicAdapter, rateLimitError, serverError, invalidRequestError } from '@animalabs/membrane';
+import { AnthropicAdapter, cacheLineageKey, rateLimitError, serverError, invalidRequestError, contextLengthError } from '@animalabs/membrane';
 import { LoggingAnthropicAdapter } from '../src/logging-adapter.js';
 
 const BIG = { model: 'claude-fable-5', messages: [{ role: 'user', content: 'x'.repeat(200_000) }] };
@@ -44,18 +45,9 @@ function failWith(err: unknown, raw: unknown = BIG): void {
   proto.stream = fail;
 }
 
-/** Make the underlying adapter answer: a call that gets a response. */
-function succeed(): void {
-  const ok = async (_req: unknown, a?: unknown, b?: unknown) => {
-    const opts = (b ?? a) as { onRequest?: (r: unknown) => void } | undefined;
-    opts?.onRequest?.(BIG);
-    return { content: [], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, raw: { stop_reason: 'end_turn' } };
-  };
-  proto.complete = ok;
-  proto.stream = ok;
-}
-
 const sha = (raw: unknown) => createHash('sha256').update(JSON.stringify(raw)).digest('hex');
+/** A request of its own cache lineage: the system text is part of the lineage. */
+const ofLineage = (name: string, content = 'x') => ({ model: 'claude-fable-5', system: [{ type: 'text', text: name }], messages: [{ role: 'user', content }] });
 const newAdapter = () => new LoggingAnthropicAdapter({ apiKey: 'test-key' }, logPath, () => ({ enabled: false, budgetTokens: 0 }));
 
 /** Call `n` times on one adapter; the error records it wrote, in order. */
@@ -102,31 +94,146 @@ test('the note counts UTF-8 bytes, not string length', async () => {
   expect((await errorRecords('stream', 2))[1].rawRequestOmitted).toMatchObject({ bytes });
 });
 
-test('requests are told apart: A, B, A keeps A and B whole and notes the second A', async () => {
+test('a storm across turns is one run: each turn adds a message, and only the first is kept whole', async () => {
   const adapter = newAdapter();
-  failWith(rateLimitError('429'));
-  await errorRecords('stream', 1, adapter);
-  failWith(rateLimitError('429'), NON_ASCII);
-  await errorRecords('stream', 1, adapter);
-  failWith(rateLimitError('429'));
-  const [a, b, again] = await errorRecords('stream', 1, adapter);
-  expect(a.rawRequest).toEqual(BIG);
-  expect(b.rawRequest).toEqual(NON_ASCII);
-  expect(again.rawRequest).toBeUndefined();
-  expect(again.requestSha256).toBe(sha(BIG));
+  const turns = Array.from({ length: 20 }, (_, n) => ({
+    ...BIG,
+    messages: [...BIG.messages, ...Array.from({ length: n }, (_, i) => ({ role: 'user', content: `[inference-failed] turn ${i}` }))],
+  }));
+  for (const turn of turns) {
+    failWith(rateLimitError('429'), turn);
+    await errorRecords('stream', 1, adapter);
+  }
+  const records = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  expect(records).toHaveLength(20);
+  expect(records[0].rawRequest).toEqual(turns[0]);
+  for (const [n, rec] of records.slice(1).entries()) {
+    expect(rec.rawRequest).toBeUndefined();
+    expect(rec.requestSha256).toBe(sha(turns[n + 1]));
+    expect(rec.rawRequestOmitted).toMatchObject({ reason: expect.stringContaining('failed with this kind of error (its type and HTTP status, or for an untyped error its name) since a call on it last succeeded, with no hour between its failures') });
+  }
+  // One copy of a ~200 KB request, and nineteen notes.
+  expect(readFileSync(logPath).length).toBeLessThan(2 * JSON.stringify(BIG).length);
 });
 
-test("another caller's response doesn't make a storm write its request again", async () => {
+test('runs are told apart by lineage: each lineage keeps its own first failure', async () => {
   const adapter = newAdapter();
-  failWith(rateLimitError('429'));
-  await errorRecords('stream', 1, adapter);
-  succeed();
-  await adapter.stream({ model: 'claude-fable-5', messages: [] } as never, {} as never);
-  failWith(rateLimitError('429'));
-  const records = await errorRecords('stream', 1, adapter);
-  expect(records).toHaveLength(2);
-  expect(records[1].rawRequest).toBeUndefined();
-  expect(records[1].rawRequestOmitted).toMatchObject({ bytes: JSON.stringify(BIG).length });
+  for (const name of ['a', 'b', 'a', 'b']) {
+    failWith(rateLimitError('429'), ofLineage(name));
+    await errorRecords('stream', 1, adapter);
+  }
+  const records = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  expect(records.map((r) => r.rawRequest !== undefined)).toEqual([true, true, false, false]);
+});
+
+test('within a run, the first failure of each kind is kept whole', async () => {
+  const adapter = newAdapter();
+  const kept: boolean[] = [];
+  for (const [n, err] of [rateLimitError('429'), rateLimitError('429'), invalidRequestError('400 prompt is too long'), invalidRequestError('400 prompt is too long'), new Error('socket hang up'), new Error('socket hang up'), rateLimitError('429')].entries()) {
+    failWith(err, ofLineage('a', `turn ${n}`));
+    kept.push((await errorRecords('stream', 1, adapter)).at(-1)!.rawRequest !== undefined);
+  }
+  // The run keeps every type it has met: the 429 after the others is noted.
+  expect(kept).toEqual([true, false, true, false, true, false, false]);
+});
+
+test('a kind is the error type with its HTTP status, or an untyped error\'s name', async () => {
+  const adapter = newAdapter();
+  const kept: boolean[] = [];
+  // membrane types every 5xx as server: a 500 after 529s is another kind. Two
+  // types that share a status are two kinds too.
+  const errors = [serverError('529 overloaded', 529), serverError('529 overloaded', 529), serverError('500 invalid_request_error', 500), invalidRequestError('400 roles must alternate'), contextLengthError('400 prompt is too long'), new Error('socket hang up'), new TypeError('x is not a function'), new TypeError('y is not a function')];
+  for (const [n, err] of errors.entries()) {
+    failWith(err, ofLineage('a', `turn ${n}`));
+    kept.push((await errorRecords('stream', 1, adapter)).at(-1)!.rawRequest !== undefined);
+  }
+  expect(kept).toEqual([true, false, true, true, true, true, true, false]);
+});
+
+test('a run ends an hour after its last failed call, and a failure within the hour keeps it going', async () => {
+  const adapter = newAdapter();
+  // bun's system time stands still once set, so each failure happens at `now`.
+  let now = Date.parse('2026-10-21T09:00:00Z');
+  const fail = async (content: string) => {
+    setSystemTime(new Date(now));
+    failWith(rateLimitError('429'), ofLineage('a', content));
+    return (await errorRecords('stream', 1, adapter)).at(-1)!.rawRequest !== undefined;
+  };
+  try {
+    expect(await fail('09:00')).toBe(true);
+    now += 50 * 60_000;
+    expect(await fail('09:50')).toBe(false);
+    now += 60 * 60_000;
+    // An hour after the last failure, 110 minutes after the first: the run goes on.
+    expect(await fail('10:50')).toBe(false);
+    now += 60 * 60_000 + 1;
+    // A millisecond past the hour: a new run, whose first failure is kept.
+    expect(await fail('11:50')).toBe(true);
+    now += 60_000;
+    // The new run goes on from there.
+    expect(await fail('11:51')).toBe(false);
+  } finally {
+    setSystemTime();
+  }
+});
+
+test("a keepalive poke's success doesn't end its lineage's run", async () => {
+  const adapter = newAdapter();
+  const poke = (outcome: 'success' | 'error') => (adapter as unknown as { logKeepaliveCall(call: unknown): void }).logKeepaliveCall({
+    key: cacheLineageKey(ofLineage('a') as never), lane: 'stream', startedAt: Date.now(), durationMs: 1, request: { model: 'claude-fable-5', max_tokens: 0, messages: [] },
+    ...(outcome === 'success' ? { outcome, response: { usage: { input_tokens: 1 } } } : { outcome, error: rateLimitError('429') }),
+  });
+  const fail = async (content: string) => {
+    failWith(rateLimitError('429'), ofLineage('a', content));
+    return (await errorRecords('stream', 1, adapter)).at(-1)!.rawRequest !== undefined;
+  };
+  expect(await fail('first')).toBe(true);
+  poke('error');
+  expect(await fail('after a failed poke')).toBe(false);
+  poke('success');
+  expect(await fail('after a poke that succeeded')).toBe(false);
+  // Both pokes were written, so the poke that succeeded reached its record.
+  const pokes = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).filter((r) => r.kind === 'keepalive');
+  expect(pokes.map((r) => r.type)).toEqual(['error', 'call']);
+});
+
+test("a success ends its own lineage's run, and another lineage's success doesn't", async () => {
+  const adapter = newAdapter();
+  const answer = async (raw: unknown) => {
+    const ok = async (_req: unknown, a?: unknown, b?: unknown) => {
+      ((b ?? a) as { onRequest?: (r: unknown) => void } | undefined)?.onRequest?.(raw);
+      return { content: [], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, raw: { stop_reason: 'end_turn' } };
+    };
+    proto.complete = ok;
+    proto.stream = ok;
+    await adapter.stream({ model: 'claude-fable-5', messages: [] } as never, {} as never);
+  };
+  const fail = async (raw: unknown) => {
+    failWith(rateLimitError('429'), raw);
+    return (await errorRecords('stream', 1, adapter)).at(-1)!;
+  };
+  expect((await fail(ofLineage('a'))).rawRequest).toBeDefined();
+  // Another caller's success, on another lineage: a's run goes on.
+  await answer(ofLineage('b'));
+  expect((await fail(ofLineage('a', 'next turn'))).rawRequest).toBeUndefined();
+  // a's own success ends its run, so its next failure is a new run's first.
+  await answer(ofLineage('a', 'answered'));
+  expect((await fail(ofLineage('a', 'later'))).rawRequest).toEqual(ofLineage('a', 'later'));
+});
+
+test('past its budget, a log notes even a new run\'s first failure', async () => {
+  const adapter = newAdapter();
+  expect((adapter as unknown as { failedCopyBudget: number }).failedCopyBudget).toBe(64 * 1024 * 1024);
+  const size = JSON.stringify(ofLineage('a', 'x'.repeat(1000))).length;
+  (adapter as unknown as { failedCopyBudget: number }).failedCopyBudget = 2 * size + 10;
+  const kept: boolean[] = [];
+  for (const name of ['a', 'b', 'c']) {
+    failWith(rateLimitError('429'), ofLineage(name, 'x'.repeat(1000)));
+    const rec = (await errorRecords('stream', 1, adapter)).at(-1)!;
+    kept.push(rec.rawRequest !== undefined);
+    if (name === 'c') expect(rec.rawRequestOmitted).toMatchObject({ bytes: size, reason: expect.stringContaining('has no room for this one') });
+  }
+  expect(kept).toEqual([true, true, false]);
 });
 
 test('a request whose record the line bound cut is tried whole again, not noted as written', async () => {
@@ -141,27 +248,44 @@ test('a request whose record the line bound cut is tried whole again, not noted 
   }
 }, 30_000);
 
-test('the memory keeps the latest 256 requests: the oldest is written whole again, the newest noted', async () => {
+test('the memory keeps the latest 256 runs: the oldest is written whole again, the newest noted', async () => {
   const adapter = newAdapter();
-  const req = (n: number) => ({ model: 'claude-fable-5', messages: [{ role: 'user', content: `request ${n}` }] });
   for (let n = 0; n <= 256; n++) {
-    failWith(rateLimitError('429'), req(n));
+    failWith(rateLimitError('429'), ofLineage(`agent ${n}`));
     await errorRecords('stream', 1, adapter);
   }
-  failWith(rateLimitError('429'), req(256));
+  failWith(rateLimitError('429'), ofLineage('agent 256', 'again'));
   const newest = (await errorRecords('stream', 1, adapter)).at(-1)!;
   expect(newest.rawRequest).toBeUndefined();
-  failWith(rateLimitError('429'), req(0));
+  // The second oldest is still remembered: the memory holds 256.
+  failWith(rateLimitError('429'), ofLineage('agent 1', 'again'));
+  expect((await errorRecords('stream', 1, adapter)).at(-1)!.rawRequest).toBeUndefined();
+  failWith(rateLimitError('429'), ofLineage('agent 0', 'again'));
   const oldest = (await errorRecords('stream', 1, adapter)).at(-1)!;
-  expect(oldest.rawRequest).toEqual(req(0));
+  expect(oldest.rawRequest).toEqual(ofLineage('agent 0', 'again'));
 }, 30_000);
 
-test('a request membrane rejects before onRequest is kept from the error', async () => {
-  const err = Object.assign(new Error('prefill unsupported'), { type: 'unsupported', rawRequest: BIG });
-  const fail = async () => { throw err; };
-  proto.complete = fail;
-  proto.stream = fail;
-  expect((await errorRecords('complete', 1))[0].rawRequest).toEqual(BIG);
+test("a request membrane's own check refuses before sending is kept from the error, with its lineage", async () => {
+  // claude-opus-4-8 takes no assistant prefill: membrane refuses an
+  // assistant-ended request before onRequest, with the built request on the
+  // error. Nothing is sent: the adapter's own complete, unpatched.
+  const adapter = newAdapter();
+  const request = { model: 'claude-opus-4-8', maxTokens: 16, messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'Once upon' }] };
+  await expect(adapter.complete(request as never)).rejects.toMatchObject({ type: 'unsupported' });
+  const [rec] = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  expect(rec.type).toBe('error');
+  expect(rec.rawRequest).toMatchObject({ model: 'claude-opus-4-8', messages: [{ role: 'user' }, { role: 'assistant' }] });
+  expect(rec.requestSummary.lineage).toBe(cacheLineageKey(rec.rawRequest));
+});
+
+test('a request with no lineage is held to the budget alone', async () => {
+  const adapter = newAdapter();
+  // Room for two copies of it, not three.
+  (adapter as unknown as { failedCopyBudget: number }).failedCopyBudget = 2 * JSON.stringify('not an object').length;
+  failWith(rateLimitError('429'), 'not an object');
+  const records = await errorRecords('stream', 3, adapter);
+  expect(records.map((r) => [r.rawRequest, r.requestSummary?.lineage])).toEqual([['not an object', undefined], ['not an object', undefined], [undefined, undefined]]);
+  expect(records[2].rawRequestOmitted).toMatchObject({ reason: expect.stringContaining('has no room for this one') });
 });
 
 test('LLM_CALLS_FULL_PAYLOADS=1 keeps every copy', async () => {
