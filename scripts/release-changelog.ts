@@ -12,12 +12,16 @@
 // It also writes the release's own fields into package.json, which npm's full
 // manifest of the version (what `npm view` reads) keeps, as
 // `connectomeRelease`:
-// - `breaking`: whether the new section has a Breaking subsection with
-//   anything in it, as release-bump.mjs reads a pending breaking change;
-// - `cacheWrite`: whether the release costs each resident one full
-//   prompt-cache write, from RELEASE_CACHE_WRITE (yes or no), which the cutter
-//   takes from connectome-smoke's cache-write lane; left out when it's unset,
-//   so the release says nothing of its cost.
+// - `breaking`: whether anything is breaking since the last final release:
+//   the new section, or a prerelease section below it back to that release,
+//   has a Breaking subsection with anything in it, as release-bump.mjs reads a
+//   pending breaking change. A line's breaking entries are folded into its
+//   prereleases, which npm may not hold, so the final release says so too;
+// - `cacheWrite`: whether the release changes what each resident's requests
+//   carry before its newest turn, so that each one's next request writes its
+//   prompt cache in full, from RELEASE_CACHE_WRITE (`yes@<version>` or
+//   `no@<version>`, naming the version being cut); left out when it's unset,
+//   so a release nobody measured says nothing of its cost.
 import {
   existsSync,
   readdirSync,
@@ -120,10 +124,8 @@ function collectFragments(): Fragment[] {
 // Directly-filed entries are kept; a fragment joins the first subsection
 // whose title starts with its category (so audience-qualified headings like
 // '### Breaking (recipe authors only)' still attract 'breaking' fragments),
-// or a new canonical subsection. Output is emitted in canonical order, with
-// whether a Breaking subsection has anything in it, read as release-bump.mjs
-// reads one.
-function mergeFragments(body: string, frags: Fragment[]): { text: string; breaking: boolean } {
+// or a new canonical subsection. Output is emitted in canonical order.
+function mergeFragments(body: string, frags: Fragment[]): string {
   interface Part {
     title: string;
     lines: string[];
@@ -155,28 +157,61 @@ function mergeFragments(body: string, frags: Fragment[]): { text: string; breaki
     return i === -1 ? CATEGORIES.length : i;
   };
   const chunks: string[] = [];
-  let breaking = false;
   const pre = preamble.join("\n").trim();
   if (pre) chunks.push(pre);
   for (const p of [...parts].sort((a, b) => rank(a.title) - rank(b.title))) {
     const content = p.lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
     chunks.push(content ? `### ${p.title}\n\n${content}` : `### ${p.title}`);
-    if (content && p.title.toLowerCase().startsWith("breaking")) breaking = true;
   }
-  return { text: chunks.join("\n\n"), breaking };
+  return chunks.join("\n\n");
 }
 
-/** RELEASE_CACHE_WRITE as the release's `cacheWrite`: yes or no, or nothing
- *  recorded when it's unset. */
-function cacheWriteOf(value: string | undefined): boolean | undefined {
+/** Whether a section has a Breaking subsection with anything in it, read as
+ *  release-bump.mjs reads a pending breaking change: subsection by subsection,
+ *  any non-blank line under a title that starts with "breaking". */
+function hasBreaking(section: string): boolean {
+  let title: string | null = null;
+  for (const line of section.split("\n")) {
+    const h = line.match(/^###\s+(.*)$/);
+    if (h) title = (h[1] ?? "").trim();
+    else if (title !== null && title.toLowerCase().startsWith("breaking") && line.trim() !== "") return true;
+  }
+  return false;
+}
+
+/** The sections of the prereleases cut since the last final release, from the
+ *  changelog below Unreleased, newest first. */
+function prereleasesSince(rest: string): string[] {
+  const sections: string[] = [];
+  for (const part of rest.split(/^(?=## )/m)) {
+    const version = part.match(/^## (\S+)/)?.[1];
+    if (version === undefined) continue;
+    if (!version.includes("-")) break;
+    sections.push(part);
+  }
+  return sections;
+}
+
+/** RELEASE_CACHE_WRITE as the release's `cacheWrite`: `yes@<version>` or
+ *  `no@<version>`, naming the version being cut, so a value left in a shell
+ *  from an earlier cut is refused; nothing recorded when it's unset. */
+function cacheWriteOf(value: string | undefined, version: string): boolean | undefined {
   if (value === undefined) return undefined;
-  if (value === "yes") return true;
-  if (value === "no") return false;
-  return fail(
-    `RELEASE_CACHE_WRITE is ${JSON.stringify(value)}: give yes (this release costs each resident one full ` +
-      "prompt-cache write) or no (it costs none), from connectome-smoke's cache-write lane, or leave it unset to " +
-      "record nothing of its cost.",
-  );
+  const m = /^(yes|no)@(.+)$/.exec(value);
+  if (!m) {
+    return fail(
+      `RELEASE_CACHE_WRITE is ${JSON.stringify(value)}: give yes@${version} if this release changes what each ` +
+        `resident's requests carry before its newest turn, so that each one's next request writes its prompt ` +
+        `cache in full, or no@${version} if it doesn't, or leave it unset to record nothing of its cost.`,
+    );
+  }
+  if (m[2] !== version) {
+    return fail(
+      `RELEASE_CACHE_WRITE is ${JSON.stringify(value)}, which names ${m[2]}, but this cut is ${version}: set it ` +
+        `from this release's measurement, or leave it unset to record nothing of its cost.`,
+    );
+  }
+  return m[1] === "yes";
 }
 
 function main(): void {
@@ -184,7 +219,7 @@ function main(): void {
     version: string;
   };
   const { version } = pkg;
-  const cacheWrite = cacheWriteOf(process.env.RELEASE_CACHE_WRITE);
+  const cacheWrite = cacheWriteOf(process.env.RELEASE_CACHE_WRITE, version);
   const text = readFileSync(CHANGELOG, "utf8");
   const fragments = collectFragments();
 
@@ -206,7 +241,9 @@ function main(): void {
   const headerIndex = header.index ?? 0;
 
   const escaped = version.replace(/[.]/g, "\\.");
-  if (new RegExp(`^## ${escaped}([^0-9]|$)`, "m").test(text)) {
+  // The version ends at whitespace or the line's end, so 1.1.0 is neither
+  // 1.1.01 nor its own prerelease 1.1.0-0, which a final release follows.
+  if (new RegExp(`^## ${escaped}([ \\t]|$)`, "m").test(text)) {
     fail(`a '## ${version}' section already exists.`);
   }
 
@@ -215,7 +252,7 @@ function main(): void {
   const oldBody = nextSection === -1 ? afterHeader : afterHeader.slice(0, nextSection);
   const rest = nextSection === -1 ? "" : afterHeader.slice(nextSection);
 
-  const { text: merged, breaking } = mergeFragments(oldBody, fragments);
+  const merged = mergeFragments(oldBody, fragments);
   if (!/^[ \t]*[-*] /m.test(merged)) {
     fail(
       `nothing to release as ${version} — no fragments in ${FRAGMENT_DIR}/ ` +
@@ -224,8 +261,8 @@ function main(): void {
   }
 
   // The release's own fields (header comment), after every refusal. They
-  // describe this release alone, so an earlier release's are replaced; JSON
-  // leaves out a cacheWrite that's unset.
+  // replace an earlier release's; JSON leaves out a cacheWrite that's unset.
+  const breaking = [merged, ...prereleasesSince(rest)].some(hasBreaking);
   pkg.connectomeRelease = { breaking, cacheWrite };
   writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
 

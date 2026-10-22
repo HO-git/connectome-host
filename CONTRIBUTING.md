@@ -132,14 +132,16 @@ never do.
   `Unreleased` above, and refuses to release when there is nothing to
   release. It also writes the release's own fields into `package.json` as
   `connectomeRelease`, which npm's full manifest of the version (what
-  `npm view` reads) keeps:
-  `breaking`, whether the section has a Breaking subsection with anything
-  in it, as `npm version`'s check of a pending breaking entry reads one; and
-  `cacheWrite`, from `RELEASE_CACHE_WRITE=yes` or `no`, whether the release
-  costs each resident one full prompt-cache write (set it from
-  connectome-smoke's cache-write lane; left unset, the release records
-  nothing of its cost, and any other value is refused). npm then commits and
-  tags. `git push --follow-tags` triggers the
+  `npm view` reads) keeps. `breaking` is whether anything is breaking since
+  the last final release: the new section, or a prerelease section below it
+  back to that release, has a Breaking subsection with anything in it, as
+  `npm version`'s check of a pending breaking entry reads one. `cacheWrite`
+  is whether the release changes what each resident's requests carry before
+  its newest turn, so that each one's next request writes its prompt cache
+  in full. Give it as `RELEASE_CACHE_WRITE=yes@<version>` or
+  `no@<version>`, naming the version being cut; any other value is refused,
+  and a cut nobody measured leaves it unset and records nothing of its
+  cost. npm then commits and tags. `git push --follow-tags` triggers the
   publish workflow, which refuses a tag with no matching changelog section,
   builds the Web UI and checks in a job of its own that the packed release,
   which carries it in `dist/web`, installs and runs on its own

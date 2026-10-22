@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 const SCRIPT = fileURLToPath(
   new URL("../scripts/release-changelog.ts", import.meta.url),
 );
+const BUMP = fileURLToPath(new URL("../scripts/release-bump.mjs", import.meta.url));
 
 const BASE_CHANGELOG = [
   "# Changelog",
@@ -186,7 +187,7 @@ test("records the release's own fields in package.json, breaking and cacheWrite,
   const others = { description: "kept", files: ["dist"], engines: { bun: ">=1.3.0" }, dependencies: { a: "^1.0.0" } };
   const dir = setup({
     pkg: others,
-    cacheWrite: "yes",
+    cacheWrite: "yes@1.1.0",
     fragments: { "b.breaking.md": "- **Recipe authors:** breaking thing.\n", "f.fixed.md": "- Fixed thing.\n" },
   });
   const r = run(dir);
@@ -197,14 +198,14 @@ test("records the release's own fields in package.json, breaking and cacheWrite,
   assert.ok(pkgText(dir).endsWith("}\n") && pkgText(dir).includes('\n  "name": "fixture",'), "two-space JSON with a final newline");
 });
 
-test("replaces an earlier release's fields, records no cost when RELEASE_CACHE_WRITE is unset, and 'no' as false", () => {
+test("replaces an earlier release's fields, records no cost when RELEASE_CACHE_WRITE is unset, and no@<version> as false", () => {
   const earlier = { connectomeRelease: { breaking: true, cacheWrite: true } };
   const unset = setup({ pkg: earlier, fragments: { "f.fixed.md": "- Fixed thing.\n" } });
   const r = run(unset);
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(release(unset), { breaking: false }, "the fields describe this release alone");
 
-  const no = setup({ cacheWrite: "no", pkg: earlier, fragments: { "f.fixed.md": "- Fixed thing.\n" } });
+  const no = setup({ cacheWrite: "no@1.1.0", pkg: earlier, fragments: { "f.fixed.md": "- Fixed thing.\n" } });
   const n = run(no);
   assert.equal(n.status, 0, n.stderr);
   assert.deepEqual(release(no), { breaking: false, cacheWrite: false });
@@ -228,6 +229,61 @@ test("reads a Breaking subsection as the bump check does: prose under a qualifie
   assert.deepEqual(release(empty), { breaking: false });
 });
 
+test("records breaking since the last final release: a final release after a breaking prerelease is breaking, the next one isn't", () => {
+  const dir = setup({ version: "1.1.0-0", fragments: { "b.breaking.md": "- **Recipe authors:** breaking thing.\n" } });
+  const cut = (version: string) => {
+    writeFileSync(join(dir, "package.json"), `${JSON.stringify({ name: "fixture", version }, null, 2)}\n`);
+    writeFileSync(join(dir, "changelog.d", `${version}.fixed.md`), `- Fixed in ${version}.\n`);
+    const r = run(dir);
+    assert.equal(r.status, 0, r.stderr);
+    return release(dir);
+  };
+  assert.deepEqual(cut("1.1.0-0"), { breaking: true });
+  assert.deepEqual(cut("1.1.0-1"), { breaking: true }, "a later prerelease of the line");
+  assert.deepEqual(cut("1.1.0"), { breaking: true }, "the final release finishing the line");
+  assert.deepEqual(cut("1.1.1"), { breaking: false }, "past the last final release");
+});
+
+// release-bump.mjs is vendored, so this script reads a Breaking subsection
+// with its own copy of the rule; both read the same Unreleased bodies alike.
+test("reads a pending Breaking subsection as release-bump.mjs does", () => {
+  const bodies: Array<[string, string]> = [
+    ["Breaking", "- **Recipe authors:** a bullet.\n"],
+    ["Breaking", "* a star bullet.\n"],
+    ["Breaking", "+ a plus bullet.\n"],
+    ["Breaking", "1. A numbered item.\n"],
+    ["Breaking", "Prose, with no list at all.\n"],
+    ["Breaking (module authors only)", "- A change.\n"],
+    ["BREAKING", "- A change.\n"],
+    ["breaking changes", "Prose.\n"],
+    ["Breaking", ""],
+    ["Changed (module authors)", "Prose about a change.\n"],
+  ];
+  for (const [title, body] of bodies) {
+    const dir = setup({
+      changelog: BASE_CHANGELOG.replace("## Unreleased\n", `## Unreleased\n\n### ${title}\n\n${body}`),
+      fragments: { "f.fixed.md": "- Fixed thing.\n" },
+    });
+    let bumpRefused: boolean;
+    try {
+      execFileSync(process.execPath, [BUMP], {
+        cwd: dir,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { PATH: process.env.PATH ?? "", npm_old_version: "1.0.0", npm_new_version: "1.0.1" },
+      });
+      bumpRefused = false;
+    } catch {
+      bumpRefused = true;
+    }
+    const r = run(dir);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal((release(dir) as { breaking: boolean }).breaking, bumpRefused, `'### ${title}' over ${JSON.stringify(body)}`);
+  }
+});
+
+/** A pattern matching `text` as written. */
+const literal = (text: string) => new RegExp(text.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&"));
+
 const refusals: Array<[string, Fixture, RegExp]> = [
   ["nothing to release", {}, /nothing to release as 1\.1\.0/],
   ["duplicate version section", { version: "1.0.0", fragments: { "a.fixed.md": "- x\n" } }, /'## 1\.0\.0' section already exists/],
@@ -248,8 +304,12 @@ const refusals: Array<[string, Fixture, RegExp]> = [
   ["tab-indented continuation", { fragments: { "t.fixed.md": "- ok\n\tcontinued\n" } }, /offending line: '\tcontinued'/],
   ["no Unreleased heading", { changelog: "# Changelog\n\n## 1.0.0 — 2026-01-01\n\n- x\n", fragments: { "a.fixed.md": "- x\n" } }, /no '## Unreleased' section/],
   ["two Unreleased headings", { changelog: BASE_CHANGELOG + "\n## Unreleased\n\n- stranded\n", fragments: { "a.fixed.md": "- x\n" } }, /2 '## Unreleased' headings/],
-  ["a RELEASE_CACHE_WRITE other than yes or no", { cacheWrite: "maybe", fragments: { "a.fixed.md": "- x\n" } }, /RELEASE_CACHE_WRITE is "maybe": give yes/],
-  ["an empty RELEASE_CACHE_WRITE", { cacheWrite: "", fragments: { "a.fixed.md": "- x\n" } }, /RELEASE_CACHE_WRITE is "": give yes/],
+  ...["maybe", "", "yes", "no", "true", "YES@1.1.0", "yes@1.1.0\n"].map((value): [string, Fixture, RegExp] => [
+    `a RELEASE_CACHE_WRITE of ${JSON.stringify(value)}`,
+    { cacheWrite: value, fragments: { "a.fixed.md": "- x\n" } },
+    literal(`RELEASE_CACHE_WRITE is ${JSON.stringify(value)}: give yes@1.1.0 if`),
+  ]),
+  ["a RELEASE_CACHE_WRITE naming another version", { cacheWrite: "yes@1.0.0", fragments: { "a.fixed.md": "- x\n" } }, /RELEASE_CACHE_WRITE is "yes@1\.0\.0", which names 1\.0\.0, but this cut is 1\.1\.0/],
 ];
 
 for (const [name, fixture, message] of refusals) {
