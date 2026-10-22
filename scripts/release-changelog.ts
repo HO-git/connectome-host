@@ -12,16 +12,17 @@
 // It also writes the release's own fields into package.json, which npm's full
 // manifest of the version (what `npm view` reads) keeps, as
 // `connectomeRelease`:
-// - `breaking`: whether anything is breaking since the last final release:
-//   the new section, or a prerelease section below it back to that release,
-//   has a Breaking subsection with anything in it, as release-bump.mjs reads a
-//   pending breaking change. A line's breaking entries are folded into its
+// - `breaking`: whether anything is breaking since the last final release
+//   below it in the changelog, which holds the history of the branch it's cut
+//   on: the new section, or any section between them, has a Breaking
+//   subsection with anything in it, as release-bump.mjs reads a pending
+//   breaking change. A line's breaking entries are folded into its
 //   prereleases, which npm may not hold, so the final release says so too;
-// - `cacheWrite`: whether the release changes what each resident's requests
-//   carry before its newest turn, so that each one's next request writes its
-//   prompt cache in full, from RELEASE_CACHE_WRITE (`yes@<version>` or
-//   `no@<version>`, naming the version being cut); left out when it's unset,
-//   so a release nobody measured says nothing of its cost.
+// - `cacheWrite`: whether an update from that last final release changes what
+//   each resident's requests carry before its newest turn, so that each one's
+//   next request writes its prompt cache in full, from RELEASE_CACHE_WRITE
+//   (`yes@<version>` or `no@<version>`, naming the version being cut); left
+//   out when it's unset, so a release nobody measured says nothing of its cost.
 import {
   existsSync,
   readdirSync,
@@ -179,14 +180,15 @@ function hasBreaking(section: string): boolean {
   return false;
 }
 
-/** The sections of the prereleases cut since the last final release, from the
- *  changelog below Unreleased, newest first. */
-function prereleasesSince(rest: string): string[] {
+/** The sections cut since the last final release, from the changelog below
+ *  Unreleased, newest first: the prereleases', in practice. They end at the
+ *  first final release's heading, a version with no prerelease after it
+ *  (`## 1.1.0 — …`, a bare `## 1.1.0`). Every other heading counts, so one
+ *  edited by hand errs toward `breaking` true. */
+function sectionsSinceFinal(rest: string): string[] {
   const sections: string[] = [];
   for (const part of rest.split(/^(?=## )/m)) {
-    const version = part.match(/^## (\S+)/)?.[1];
-    if (version === undefined) continue;
-    if (!version.includes("-")) break;
+    if (/^## \d+\.\d+\.\d+(?![-.\d])/.test(part)) break;
     sections.push(part);
   }
   return sections;
@@ -207,8 +209,8 @@ function cacheWriteOf(value: string | undefined, version: string): boolean | und
   }
   if (m[2] !== version) {
     return fail(
-      `RELEASE_CACHE_WRITE is ${JSON.stringify(value)}, which names ${m[2]}, but this cut is ${version}: set it ` +
-        `from this release's measurement, or leave it unset to record nothing of its cost.`,
+      `RELEASE_CACHE_WRITE is ${JSON.stringify(value)}, which names ${m[2]}, but this cut is ${version}: give ` +
+        `yes@${version} or no@${version} for this release, or leave it unset to record nothing of its cost.`,
     );
   }
   return m[1] === "yes";
@@ -262,7 +264,7 @@ function main(): void {
 
   // The release's own fields (header comment), after every refusal. They
   // replace an earlier release's; JSON leaves out a cacheWrite that's unset.
-  const breaking = [merged, ...prereleasesSince(rest)].some(hasBreaking);
+  const breaking = [merged, ...sectionsSinceFinal(rest)].some(hasBreaking);
   pkg.connectomeRelease = { breaking, cacheWrite };
   writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
 
