@@ -130,7 +130,16 @@ never do.
   (subsections emitted in `### Breaking` / `### Added` / `### Changed` /
   `### Fixed` order), deletes the consumed fragments, keeps a fresh empty
   `Unreleased` above, and refuses to release when there is nothing to
-  release; npm then commits and tags. `git push --follow-tags` triggers the
+  release. It also writes the release's own fields into `package.json` as
+  `connectomeRelease`, which npm's full manifest of the version (what
+  `npm view` reads) keeps:
+  `breaking`, whether the section has a Breaking subsection with anything
+  in it, as `npm version`'s check of a pending breaking entry reads one; and
+  `cacheWrite`, from `RELEASE_CACHE_WRITE=yes` or `no`, whether the release
+  costs each resident one full prompt-cache write (set it from
+  connectome-smoke's cache-write lane; left unset, the release records
+  nothing of its cost, and any other value is refused). npm then commits and
+  tags. `git push --follow-tags` triggers the
   publish workflow, which refuses a tag with no matching changelog section,
   builds the Web UI and checks in a job of its own that the packed release,
   which carries it in `dist/web`, installs and runs on its own

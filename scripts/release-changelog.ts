@@ -8,6 +8,16 @@
 // `## X.Y.Z — YYYY-MM-DD` section, deletes the consumed fragments, and
 // leaves a fresh empty `## Unreleased` above it. Refuses to release when
 // there is nothing to release, or when the input's shape is ambiguous.
+//
+// It also writes the release's own fields into package.json, which npm's full
+// manifest of the version (what `npm view` reads) keeps, as
+// `connectomeRelease`:
+// - `breaking`: whether the new section has a Breaking subsection with
+//   anything in it, as release-bump.mjs reads a pending breaking change;
+// - `cacheWrite`: whether the release costs each resident one full
+//   prompt-cache write, from RELEASE_CACHE_WRITE (yes or no), which the cutter
+//   takes from connectome-smoke's cache-write lane; left out when it's unset,
+//   so the release says nothing of its cost.
 import {
   existsSync,
   readdirSync,
@@ -110,8 +120,10 @@ function collectFragments(): Fragment[] {
 // Directly-filed entries are kept; a fragment joins the first subsection
 // whose title starts with its category (so audience-qualified headings like
 // '### Breaking (recipe authors only)' still attract 'breaking' fragments),
-// or a new canonical subsection. Output is emitted in canonical order.
-function mergeFragments(body: string, frags: Fragment[]): string {
+// or a new canonical subsection. Output is emitted in canonical order, with
+// whether a Breaking subsection has anything in it, read as release-bump.mjs
+// reads one.
+function mergeFragments(body: string, frags: Fragment[]): { text: string; breaking: boolean } {
   interface Part {
     title: string;
     lines: string[];
@@ -143,19 +155,36 @@ function mergeFragments(body: string, frags: Fragment[]): string {
     return i === -1 ? CATEGORIES.length : i;
   };
   const chunks: string[] = [];
+  let breaking = false;
   const pre = preamble.join("\n").trim();
   if (pre) chunks.push(pre);
   for (const p of [...parts].sort((a, b) => rank(a.title) - rank(b.title))) {
     const content = p.lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
     chunks.push(content ? `### ${p.title}\n\n${content}` : `### ${p.title}`);
+    if (content && p.title.toLowerCase().startsWith("breaking")) breaking = true;
   }
-  return chunks.join("\n\n");
+  return { text: chunks.join("\n\n"), breaking };
+}
+
+/** RELEASE_CACHE_WRITE as the release's `cacheWrite`: yes or no, or nothing
+ *  recorded when it's unset. */
+function cacheWriteOf(value: string | undefined): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (value === "yes") return true;
+  if (value === "no") return false;
+  return fail(
+    `RELEASE_CACHE_WRITE is ${JSON.stringify(value)}: give yes (this release costs each resident one full ` +
+      "prompt-cache write) or no (it costs none), from connectome-smoke's cache-write lane, or leave it unset to " +
+      "record nothing of its cost.",
+  );
 }
 
 function main(): void {
-  const { version } = JSON.parse(readFileSync("package.json", "utf8")) as {
+  const pkg = JSON.parse(readFileSync("package.json", "utf8")) as Record<string, unknown> & {
     version: string;
   };
+  const { version } = pkg;
+  const cacheWrite = cacheWriteOf(process.env.RELEASE_CACHE_WRITE);
   const text = readFileSync(CHANGELOG, "utf8");
   const fragments = collectFragments();
 
@@ -186,13 +215,19 @@ function main(): void {
   const oldBody = nextSection === -1 ? afterHeader : afterHeader.slice(0, nextSection);
   const rest = nextSection === -1 ? "" : afterHeader.slice(nextSection);
 
-  const merged = mergeFragments(oldBody, fragments);
+  const { text: merged, breaking } = mergeFragments(oldBody, fragments);
   if (!/^[ \t]*[-*] /m.test(merged)) {
     fail(
       `nothing to release as ${version} — no fragments in ${FRAGMENT_DIR}/ ` +
         "and no entries under '## Unreleased'.",
     );
   }
+
+  // The release's own fields (header comment), after every refusal. They
+  // describe this release alone, so an earlier release's are replaced; JSON
+  // leaves out a cacheWrite that's unset.
+  pkg.connectomeRelease = { breaking, cacheWrite };
+  writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
 
   // Spliced by index rather than string-replaced: `text.replace("## Unreleased", …)`
   // would hit the first *substring* occurrence, which is not necessarily the
@@ -209,6 +244,10 @@ function main(): void {
   console.log(
     `${CHANGELOG}: released '## ${version} — ${date}' from ${fragments.length} ` +
       "fragment(s) plus the Unreleased section.",
+  );
+  console.log(
+    `package.json: connectomeRelease records breaking ${breaking} and ` +
+      `${cacheWrite === undefined ? "nothing of its cache cost (RELEASE_CACHE_WRITE unset)" : `cacheWrite ${cacheWrite}`}.`,
   );
 }
 

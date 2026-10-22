@@ -39,14 +39,19 @@ interface Fixture {
   version?: string;
   changelog?: string;
   fragments?: Record<string, string>;
+  /** package.json's other fields, such as an earlier release's connectomeRelease. */
+  pkg?: Record<string, unknown>;
+  /** RELEASE_CACHE_WRITE, unset when left out. */
+  cacheWrite?: string;
 }
 
 function setup(f: Fixture): string {
   const dir = mkdtempSync(join(tmpdir(), "release-changelog-"));
   writeFileSync(
     join(dir, "package.json"),
-    JSON.stringify({ name: "fixture", version: f.version ?? "1.1.0" }),
+    `${JSON.stringify({ name: "fixture", version: f.version ?? "1.1.0", ...f.pkg }, null, 2)}\n`,
   );
+  if (f.cacheWrite !== undefined) writeFileSync(join(dir, ".cache-write"), f.cacheWrite);
   writeFileSync(join(dir, "CHANGELOG.md"), f.changelog ?? BASE_CHANGELOG);
   mkdirSync(join(dir, "changelog.d"));
   writeFileSync(join(dir, "changelog.d", "README.md"), "# Pending fragments\n");
@@ -59,11 +64,19 @@ function setup(f: Fixture): string {
 }
 
 function run(dir: string): { status: number; stdout: string; stderr: string } {
+  const env: Record<string, string | undefined> = { ...process.env };
+  delete env.RELEASE_CACHE_WRITE;
+  try {
+    env.RELEASE_CACHE_WRITE = readFileSync(join(dir, ".cache-write"), "utf8");
+  } catch {
+    // Unset: the fixture gave none.
+  }
   try {
     const stdout = execFileSync(process.execPath, [SCRIPT], {
       cwd: dir,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
+      env,
     });
     return { status: 0, stdout, stderr: "" };
   } catch (e) {
@@ -82,6 +95,8 @@ function section(text: string, version: string): string {
 }
 
 const changelog = (dir: string) => readFileSync(join(dir, "CHANGELOG.md"), "utf8");
+const pkgText = (dir: string) => readFileSync(join(dir, "package.json"), "utf8");
+const release = (dir: string) => (JSON.parse(pkgText(dir)) as { connectomeRelease?: unknown }).connectomeRelease;
 const pending = (dir: string) => readdirSync(join(dir, "changelog.d")).sort();
 
 test("folds fragments into a versioned section in canonical order and deletes them", () => {
@@ -167,6 +182,52 @@ test("accepts bullet content that merely resembles headings or rules", () => {
   assert.equal(section(changelog(dir), "1.1.0"), `### Fixed\n\n${body.trim()}`);
 });
 
+test("records the release's own fields in package.json, breaking and cacheWrite, and keeps every other field", () => {
+  const others = { description: "kept", files: ["dist"], engines: { bun: ">=1.3.0" }, dependencies: { a: "^1.0.0" } };
+  const dir = setup({
+    pkg: others,
+    cacheWrite: "yes",
+    fragments: { "b.breaking.md": "- **Recipe authors:** breaking thing.\n", "f.fixed.md": "- Fixed thing.\n" },
+  });
+  const r = run(dir);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(release(dir), { breaking: true, cacheWrite: true });
+  const { connectomeRelease: _, ...rest } = JSON.parse(pkgText(dir)) as Record<string, unknown>;
+  assert.deepEqual(rest, { name: "fixture", version: "1.1.0", ...others }, "every other field comes through unchanged");
+  assert.ok(pkgText(dir).endsWith("}\n") && pkgText(dir).includes('\n  "name": "fixture",'), "two-space JSON with a final newline");
+});
+
+test("replaces an earlier release's fields, records no cost when RELEASE_CACHE_WRITE is unset, and 'no' as false", () => {
+  const earlier = { connectomeRelease: { breaking: true, cacheWrite: true } };
+  const unset = setup({ pkg: earlier, fragments: { "f.fixed.md": "- Fixed thing.\n" } });
+  const r = run(unset);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(release(unset), { breaking: false }, "the fields describe this release alone");
+
+  const no = setup({ cacheWrite: "no", pkg: earlier, fragments: { "f.fixed.md": "- Fixed thing.\n" } });
+  const n = run(no);
+  assert.equal(n.status, 0, n.stderr);
+  assert.deepEqual(release(no), { breaking: false, cacheWrite: false });
+});
+
+test("reads a Breaking subsection as the bump check does: prose under a qualified heading counts, an empty heading doesn't", () => {
+  const prose = setup({
+    changelog: BASE_CHANGELOG.replace("## Unreleased\n", "## Unreleased\n\n### Breaking (recipe authors only)\n\nRecipe authors rename `x` to `y`.\n"),
+    fragments: { "f.fixed.md": "- Fixed thing.\n" },
+  });
+  const p = run(prose);
+  assert.equal(p.status, 0, p.stderr);
+  assert.deepEqual(release(prose), { breaking: true });
+
+  const empty = setup({
+    changelog: BASE_CHANGELOG.replace("## Unreleased\n", "## Unreleased\n\n### Breaking\n"),
+    fragments: { "f.fixed.md": "- Fixed thing.\n" },
+  });
+  const e = run(empty);
+  assert.equal(e.status, 0, e.stderr);
+  assert.deepEqual(release(empty), { breaking: false });
+});
+
 const refusals: Array<[string, Fixture, RegExp]> = [
   ["nothing to release", {}, /nothing to release as 1\.1\.0/],
   ["duplicate version section", { version: "1.0.0", fragments: { "a.fixed.md": "- x\n" } }, /'## 1\.0\.0' section already exists/],
@@ -187,16 +248,19 @@ const refusals: Array<[string, Fixture, RegExp]> = [
   ["tab-indented continuation", { fragments: { "t.fixed.md": "- ok\n\tcontinued\n" } }, /offending line: '\tcontinued'/],
   ["no Unreleased heading", { changelog: "# Changelog\n\n## 1.0.0 — 2026-01-01\n\n- x\n", fragments: { "a.fixed.md": "- x\n" } }, /no '## Unreleased' section/],
   ["two Unreleased headings", { changelog: BASE_CHANGELOG + "\n## Unreleased\n\n- stranded\n", fragments: { "a.fixed.md": "- x\n" } }, /2 '## Unreleased' headings/],
+  ["a RELEASE_CACHE_WRITE other than yes or no", { cacheWrite: "maybe", fragments: { "a.fixed.md": "- x\n" } }, /RELEASE_CACHE_WRITE is "maybe": give yes/],
+  ["an empty RELEASE_CACHE_WRITE", { cacheWrite: "", fragments: { "a.fixed.md": "- x\n" } }, /RELEASE_CACHE_WRITE is "": give yes/],
 ];
 
 for (const [name, fixture, message] of refusals) {
   test(`refuses ${name} without touching anything`, () => {
     const dir = setup(fixture);
-    const before = { changelog: changelog(dir), pending: pending(dir) };
+    const before = { changelog: changelog(dir), pending: pending(dir), pkg: pkgText(dir) };
     const r = run(dir);
     assert.equal(r.status, 1, `expected refusal, got exit ${r.status}:\n${r.stdout}${r.stderr}`);
     assert.match(r.stderr, message);
     assert.equal(changelog(dir), before.changelog, "CHANGELOG.md must be untouched");
     assert.deepEqual(pending(dir), before.pending, "no fragment may be deleted on refusal");
+    assert.equal(pkgText(dir), before.pkg, "package.json must be untouched");
   });
 }
