@@ -145,9 +145,16 @@ const OAUTH_SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for
  *  neither. */
 const FAILING_RUNS_REMEMBERED = 256;
 
-/** The most of its failing requests one log writes in full, in UTF-8 bytes,
- *  whatever else differs between them. */
+/** The most of its failing requests one log can write in full at once, in
+ *  UTF-8 bytes, whatever else differs between them: a budget that refills
+ *  at this much per FAILED_REQUEST_COPY_REFILL_MS, so a long-running
+ *  process can still keep a fresh failure after routine ones have spent it,
+ *  while the file's growth stays bounded per day. */
 const FAILED_REQUEST_COPY_BUDGET = 64 * 1024 * 1024;
+
+/** How long an empty budget for failing requests takes to refill whole. It
+ *  refills continuously, in proportion to the time passed. */
+const FAILED_REQUEST_COPY_REFILL_MS = 24 * 60 * 60 * 1000;
 
 /** How long a run of failures on a lineage lasts after its last failed call.
  *  membrane's default retry delays are at most five minutes, so a call's
@@ -759,23 +766,33 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
    *  OAuth 429 storm wrote a ~4.4MB request per retry and grew a single
    *  llm-calls file to 687MB. */
   private readonly failingRuns = new Map<string, FailingRun>();
-  /** The bytes of failing requests this log, one per process, has written in
-   *  full. It doesn't refill. */
-  private failedCopyBytes = 0;
+  /** The budget for failing requests this log, one per process, writes in
+   *  full: at most failedCopyBudget bytes at once, refilled at that much per
+   *  FAILED_REQUEST_COPY_REFILL_MS (failedCopyRoomNow). */
   private readonly failedCopyBudget = FAILED_REQUEST_COPY_BUDGET;
+  /** The budget's room, in bytes, as of failedCopyRefilledAt; undefined
+   *  before the first failing request, when the budget is whole. */
+  private failedCopyRoom: number | undefined;
+  private failedCopyRefilledAt = 0;
+  /** Whether a copy refused for the budget has been told on stderr since the
+   *  last copy written: one line per spell with no room, not one per record. */
+  private budgetRefusalTold = false;
 
   /** An error record's request fields. Whatever the error, the first failing
    *  request of each kind (failureKind) in a lineage's run of failures is
    *  kept whole, since any failure, a 429 included (see
    *  OAUTH_SYSTEM_IDENTITY), can be the request's doing, and a run's first
    *  failure of a kind is where its cause shows. The run's later failures of
-   *  that kind, and any whose request the log's FAILED_REQUEST_COPY_BUDGET
-   *  has no room for, record the request's size in `rawRequestOmitted`
-   *  instead. A request with no lineage is held to the budget alone. Each
+   *  that kind, and any whose request the log's budget for failing requests
+   *  (FAILED_REQUEST_COPY_BUDGET, refilled over FAILED_REQUEST_COPY_REFILL_MS)
+   *  has no room for now, record the request's size in `rawRequestOmitted`
+   *  instead, as a cancelled call (membrane's `abort`) always does, since a
+   *  cancellation is never the request's doing; it leaves its lineage's run
+   *  as it was. A request with no lineage is held to the budget alone. Each
    *  record with a request carries `requestSha256`, so identical requests
    *  show as such. `remember` is what to note once the record is appended
    *  whole. LLM_CALLS_FULL_PAYLOADS=1 keeps every copy. */
-  private errorRequestFields(rawRequest: unknown, lineage: string | undefined, kind: string): {
+  private errorRequestFields(rawRequest: unknown, lineage: string | undefined, kind: string, aborted: boolean): {
     fields: Record<string, unknown>;
     remember?: Written;
   } {
@@ -796,15 +813,17 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
         },
       },
     });
+    if (aborted) return omitted('a cancelled call (membrane types it `abort`) is never the request\'s doing');
     const run = lineage === undefined ? undefined : this.failingRun(lineage);
     if (run?.kinds.has(kind)) {
       return omitted('this lineage has failed with this kind of error (its type and HTTP status, or for an untyped '
         + 'error its name) since a call on it last succeeded, with no hour between its failures, and an earlier error '
         + 'record in this log has the first such request in full, unless the file was rotated since');
     }
-    if (this.failedCopyBytes + bytes > this.failedCopyBudget) {
-      return omitted(`this log's budget for failing requests in full (${this.failedCopyBudget} bytes, for the life of `
-        + 'the process) has no room for this one');
+    if (bytes > this.failedCopyRoomNow()) {
+      this.tellBudgetRefusal();
+      return omitted(`this log's budget for failing requests in full (${this.failedCopyBudget} bytes, refilled at that `
+        + 'much a day) has no room for this one now');
     }
     // Noted only once its record is written whole: a record the line bound cut
     // has no copy, so the run's next failure of the kind tries again.
@@ -827,11 +846,38 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     return run;
   }
 
+  /** The budget's room now: what was left at the last refill, plus what the
+   *  time since has refilled at failedCopyBudget per
+   *  FAILED_REQUEST_COPY_REFILL_MS, up to the whole budget. */
+  private failedCopyRoomNow(): number {
+    const now = Date.now();
+    const room = this.failedCopyRoom === undefined
+      ? this.failedCopyBudget
+      : Math.min(this.failedCopyBudget,
+        this.failedCopyRoom + (Math.max(0, now - this.failedCopyRefilledAt) * this.failedCopyBudget) / FAILED_REQUEST_COPY_REFILL_MS);
+    this.failedCopyRoom = room;
+    this.failedCopyRefilledAt = now;
+    return room;
+  }
+
+  /** One stderr line the first time the budget refuses a copy since the last
+   *  copy written, so a spent budget shows outside the records too. */
+  private tellBudgetRefusal(): void {
+    if (this.budgetRefusalTold) return;
+    this.budgetRefusalTold = true;
+    try {
+      console.error(`[llm-calls] ${new Date().toISOString()} the budget for failing requests in full `
+        + `(${this.failedCopyBudget} bytes, refilled at that much a day) has no room: failing requests are recorded `
+        + 'by size and hash until it refills. LLM_CALLS_FULL_PAYLOADS=1, read when the host starts, keeps every copy.');
+    } catch { /* never throw from logging */ }
+  }
+
   /** Notes a failing request as written in full: its bytes against the
    *  budget, and its kind in its lineage's run. A run keeps its place from
    *  when it began, for the oldest-first bound. */
   private rememberFailedRequest({ lineage, kind, bytes }: Written): void {
-    this.failedCopyBytes += bytes;
+    this.failedCopyRoom = this.failedCopyRoomNow() - bytes;
+    this.budgetRefusalTold = false;
     if (lineage === undefined) return;
     const run = this.failingRuns.get(lineage);
     if (run) {
@@ -933,7 +979,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
             }
           : (() => {
               const lineage = typeof summary.lineage === 'string' ? summary.lineage : undefined;
-              const kept = this.errorRequestFields(rawRequest, lineage, failureKind(errorFields));
+              const kept = this.errorRequestFields(rawRequest, lineage, failureKind(errorFields), errorFields?.errorType === 'abort');
               remember = kept.remember;
               return { ...head, ...ids, requestSummary: summary, ...kept.fields, ...errorFields };
             })();

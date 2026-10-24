@@ -9,7 +9,7 @@ import { readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { AnthropicAdapter, cacheLineageKey, rateLimitError, serverError, invalidRequestError, contextLengthError } from '@animalabs/membrane';
+import { AnthropicAdapter, cacheLineageKey, rateLimitError, serverError, invalidRequestError, contextLengthError, abortError } from '@animalabs/membrane';
 import { LoggingAnthropicAdapter } from '../src/logging-adapter.js';
 
 const BIG = { model: 'claude-fable-5', messages: [{ role: 'user', content: 'x'.repeat(200_000) }] };
@@ -296,5 +296,116 @@ test('LLM_CALLS_FULL_PAYLOADS=1 keeps every copy', async () => {
   for (const rec of records) {
     expect(rec.rawRequest).toEqual(BIG);
     expect(rec.requestSha256).toBe(sha(BIG));
+  }
+});
+
+/** Make the underlying adapter capture `raw`, then answer. */
+function answerWith(raw: unknown): void {
+  const ok = async (_req: unknown, a?: unknown, b?: unknown) => {
+    ((b ?? a) as { onRequest?: (r: unknown) => void } | undefined)?.onRequest?.(raw);
+    return { content: [], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, raw: { stop_reason: 'end_turn' } };
+  };
+  proto.complete = ok;
+  proto.stream = ok;
+}
+
+/** Console.error's lines while `run` runs. */
+async function stderrOf(run: () => Promise<void>): Promise<string[]> {
+  const lines: string[] = [];
+  const saved = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  try {
+    await run();
+  } finally {
+    console.error = saved;
+  }
+  return lines;
+}
+
+test('failures that each succeed on retry spend the budget, which refills over a day: a later failure of a new kind is kept', async () => {
+  const adapter = newAdapter();
+  const size = Buffer.byteLength(JSON.stringify(ofLineage('a', 'x'.repeat(1000))), 'utf8');
+  // Room for three copies at once.
+  (adapter as unknown as { failedCopyBudget: number }).failedCopyBudget = 3 * size + 10;
+  let now = Date.parse('2026-10-24T09:00:00Z');
+  const kept: boolean[] = [];
+  try {
+    const told = await stderrOf(async () => {
+      for (let i = 0; i < 5; i++) {
+        setSystemTime(new Date(now));
+        // A 529 that membrane's retry answers: the failure is its run's first, and the success ends the run.
+        failWith(serverError('overloaded', 529), ofLineage('a', 'x'.repeat(1000)));
+        kept.push((await errorRecords('stream', 1, adapter)).at(-1)!.rawRequest !== undefined);
+        answerWith(ofLineage('a', 'x'.repeat(1000)));
+        await adapter.stream({ model: 'claude-fable-5', messages: [] } as never, {} as never);
+        now += 60_000;
+      }
+    });
+    expect(kept).toEqual([true, true, true, false, false]);
+    expect(told.filter((l) => l.includes('the budget for failing requests in full'))).toHaveLength(1);
+    expect(told.find((l) => l.includes('the budget for failing requests'))).toContain('LLM_CALLS_FULL_PAYLOADS=1');
+    // A day later, the budget has refilled: a failure the request caused is kept.
+    now += 24 * 60 * 60 * 1000;
+    setSystemTime(new Date(now));
+    failWith(invalidRequestError('bad request'), ofLineage('a', 'y'.repeat(1000)));
+    const later = (await errorRecords('stream', 1, adapter)).at(-1)!;
+    expect(later.rawRequest).toEqual(ofLineage('a', 'y'.repeat(1000)));
+  } finally {
+    setSystemTime();
+  }
+});
+
+test('the budget refills in proportion to the time passed, and the stderr line comes again only after a copy is written', async () => {
+  const adapter = newAdapter();
+  const size = Buffer.byteLength(JSON.stringify(ofLineage('a', 'x'.repeat(1000))), 'utf8');
+  (adapter as unknown as { failedCopyBudget: number }).failedCopyBudget = 2 * size;
+  let now = Date.parse('2026-10-24T09:00:00Z');
+  const keep = async (name: string) => {
+    setSystemTime(new Date(now));
+    failWith(rateLimitError('429'), ofLineage(name, 'x'.repeat(1000)));
+    return (await errorRecords('stream', 1, adapter)).at(-1)!.rawRequest !== undefined;
+  };
+  try {
+    const told = await stderrOf(async () => {
+      expect(await keep('a')).toBe(true);
+      expect(await keep('b')).toBe(true);
+      expect(await keep('c')).toBe(false);
+      // A third of a day refills two thirds of a copy: still no room.
+      now += 8 * 60 * 60 * 1000;
+      expect(await keep('d')).toBe(false);
+      // Thirteen hours in all refill more than a whole copy.
+      now += 5 * 60 * 60 * 1000;
+      expect(await keep('e')).toBe(true);
+      expect(await keep('f')).toBe(false);
+    });
+    expect(told.filter((l) => l.includes('the budget for failing requests in full'))).toHaveLength(2);
+  } finally {
+    setSystemTime();
+  }
+});
+
+test("a cancelled call keeps no copy and leaves its lineage's run as it was", async () => {
+  const adapter = newAdapter();
+  let now = Date.parse('2026-10-24T09:00:00Z');
+  const call = async (err: unknown, content: string) => {
+    setSystemTime(new Date(now));
+    failWith(err, ofLineage('a', content));
+    return (await errorRecords('stream', 1, adapter)).at(-1)!;
+  };
+  try {
+    const cancelled = await call(abortError('Request was aborted'), '09:00');
+    expect(cancelled.rawRequest).toBeUndefined();
+    expect(cancelled.requestSha256).toBe(sha(ofLineage('a', '09:00')));
+    expect(cancelled.rawRequestOmitted).toMatchObject({ reason: expect.stringContaining('never the request') });
+    // The cancellation began no run: the lineage's first failure is kept.
+    expect((await call(rateLimitError('429'), '09:01')).rawRequest).toEqual(ofLineage('a', '09:01'));
+    // A cancellation 50 minutes on doesn't carry the run on: an hour after
+    // its last failure, the run has ended, and the next failure is kept.
+    now += 50 * 60_000;
+    expect((await call(abortError('Request was aborted'), '09:51')).rawRequest).toBeUndefined();
+    now += 11 * 60_000 + 1;
+    expect((await call(rateLimitError('429'), '10:02')).rawRequest).toEqual(ofLineage('a', '10:02'));
+  } finally {
+    setSystemTime();
   }
 });
