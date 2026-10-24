@@ -5,10 +5,13 @@
   failed call on it, ends the run, and keepalive pokes count for neither.
   The run's later failures of that kind, such as each retry or each turn of
   a rate-limit storm, record the request's size under `rawRequestOmitted`,
-  and each complete or stream error record with a request carries
-  `requestSha256`. The adapter remembers the runs of the 256 lineages whose
-  runs began latest, and a log writes at most 64 MiB of such copies, for
-  the life of the process. One OAuth 429 storm had grown a single log to
-  687MB. A request membrane rejects before sending (such as an unsupported
+  with the hash of the run's copy as `copySha256`, and each complete or
+  stream error record with a request carries `requestSha256`. The adapter
+  remembers the runs of the 256 lineages whose runs began latest, and a log
+  writes at most 64 MiB of such copies at once, refilled at 64 MiB a day:
+  the first copy refused for it since the last one written prints one
+  `[llm-calls]` stderr line. An anomalous response's copy isn't charged to
+  it, and a cancelled call (membrane's `abort`) keeps none. One OAuth 429
+  storm had grown a single log to 687MB. A request membrane rejects before sending (such as an unsupported
   prefill) is now kept too, from the error. `LLM_CALLS_FULL_PAYLOADS=1`
   still keeps every copy.

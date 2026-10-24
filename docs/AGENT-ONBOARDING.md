@@ -823,9 +823,13 @@ blocks; expect folds to interact with this on the next model generation.
   `anomaly` field and one `[llm-calls] … ANOMALY …` stderr line), and on the first failure of
   each kind of error (its type and HTTP status, or for an untyped error its name) in a run of
   failures on a cache lineage, until a call on it succeeds or an hour passes with no failed call
-  on it, keepalive pokes counting for neither (later failures of that kind carry `requestSha256`
-  and the request's size under `rawRequestOmitted`; the latest 256 lineages' runs are remembered;
-  at most 64 MiB of such copies per log, for the life of the process), or on every call with
+  on it, keepalive pokes counting for neither (later failures of that kind carry `requestSha256`,
+  the request's size under `rawRequestOmitted`, and the run's copy's hash as
+  `rawRequestOmitted.copySha256`, its record's `requestSha256`; the latest 256 lineages' runs are
+  remembered; at most 64 MiB of such copies per log at once, refilled at 64 MiB a day, and the
+  first one refused for it since the last one written prints one `[llm-calls]` stderr line; an
+  anomalous response's copy isn't charged to it; a cancelled call, membrane's `abort`, keeps
+  none), or on every call with
   `LLM_CALLS_FULL_PAYLOADS=1`; Anthropic keepalive pokes only with that opt-in,
   whatever their outcome; Bedrock on errors; the generic wrapper on every call. Every line,
   newline included, is capped at 16 MiB of UTF-8: an oversized or unserializable record drops its
