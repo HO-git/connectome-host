@@ -490,13 +490,21 @@ Write the block yourself only to change the policy, and then set the prices to m
 - `hysteresisCertificate: true` skips the full Pareto pass when the previously
   accepted layout is provably still selected — large latency win on quiet turns;
   `adoptEpsilon` is the score slack that lets an unchanged layout be retained.
-- `hysteresisCertificate` is optional (off unless set); every other field is
-  required. The host checks the required keys at recipe load — including that
-  `treeifyNonContiguousSummaries` / `preserveGapBearingSummaries` are explicit
-  booleans and not both `true`, and that `hysteresisCertificate`, when set, is a
-  boolean — and passes the object through whole;
-  context-manager ignores keys it doesn't know, so a misspelled optional key
-  silently does nothing. Pin the runtime and validate the recipe against it.
+- `hysteresisCertificate` is optional, and from context-manager 0.15 a strategy
+  built from a recipe takes it on unless it is `false`.
+- Three optional keys (context-manager 0.17) are on by default, and each has an
+  opt-out: `policy.ageBandSteps` (an integer from 0 to 64; 4 unless set, and 0
+  prices exact ages), `latentDemandMode` (`"joint"` unless set to
+  `"individual"`) and `engine` (`"auto"`, `"subtree"` or `"dag"`; auto runs the
+  subtree engine and falls back to the DAG one past the label ceiling).
+- Every other field is required. The host checks the block at recipe load —
+  that `treeifyNonContiguousSummaries` / `preserveGapBearingSummaries` are
+  explicit booleans and not both `true`, that `hysteresisCertificate` is a
+  boolean and the three keys above take their listed values, when set — and
+  passes the object through whole. A key under `kvUnified` or its `policy` that
+  the host doesn't read is named in a startup warning, with the key it was
+  probably meant to be; context-manager itself ignores keys it doesn't know.
+  Pin the runtime and validate the recipe against it.
 
 ---
 
@@ -536,8 +544,9 @@ strategy in the ingest script** — `adaptiveResolution` + `targetChunkTokens` a
 ingest without them leaves those as single unfoldable blocks.
 
 **Verify on a copy before first boot.** Compile a copy of the store with the recipe's
-strategy and *read* the rendered messages — no `[tool result unavailable]` / `[tool call
-omitted]` stubs, participants right, last message is the intended seam — and compare exact
+strategy and *read* the rendered messages — no `[this call's result isn't shown in this
+context. …]` / `[tool call omitted]` / `[tool result moved during context repair]` stubs,
+participants right, last message is the intended seam — and compare exact
 `count_tokens` to the estimate (a large gap means blocks are missing or doubled). Never
 open the live store with a foreign strategy config: opening chunks the frontier under that
 config (§11.8).
@@ -703,17 +712,29 @@ recipe — repair a copy of the store, as below. Separately, a merge that would 
 node is refused into the merge quarantine. Both show on `/healthz` as
 `compressionDebt.<agent>.topologyViolations` /
 `.topologyRefusals`, with `state: critical`. For **any** upgrade of an existing resident to
-context-manager 0.12 or later — including one from a pre-0.12 context-manager, which has no audit
-script of its own — install the upgrade and, before starting the resident on it, run the new
-version's audit on a **copy of the stopped store**, a full or reflinked copy, never hardlinks,
-since opening it writes:
+context-manager 0.12 or later — including one from a pre-0.12 context-manager, which has no
+audit script of its own — install the upgrade and, before starting the resident on it, run the
+new release's `--audit-stores` on its data directory right after a copy of it, as "Updating an
+install" or "Updating checkouts" in [DEPLOYMENTS.md](./DEPLOYMENTS.md) does: it opens every
+session's store, and its
+recipe's fleet children's, but one that reaches past what an update copies (outside the data
+directory, or on a trial the trial's places, or holding a link out), of which it says why it
+wasn't opened, and one a session names that isn't there yet, which a start makes empty, under
+each resident's own policy and as a start does, in place, so
+only after a copy that can put the stores back. context-manager's own script audits one store,
+on a **copy of the stopped store**, a full or reflinked copy, never hardlinks, since opening it
+writes:
 `node node_modules/@animalabs/context-manager/dist/scripts/audit-topology.js <store-copy> --namespace agents/<agent> --json > audit.json`
-(exit 2 violations, 1 it didn't finish, such as a usage error or a store it could not open, and 0
-clean; a warning on stderr that it saw nothing to audit, which can come with exit 0 or 2, means a
-wrong `--namespace`, a copy without the strategy state, a store with no summaries yet, or chunks
-none of which is linked to a summary). Repair a fresh copy of the stopped store, made the same
-way, never the store itself, since the repair and the drain write into it; from the copy on, the
-store stays as it was until the copy takes its place.
+(exit 2 violations, 1 it didn't finish, such as a usage error or a store it could not open, and
+0 clean; a warning on stderr that it saw nothing to audit, which can come with exit 0 or 2,
+means a wrong `--namespace`, a copy without the strategy state, a store with no summaries yet,
+or chunks none of which is linked to a summary). It reports the store's crossings whatever the
+resident's policy, which the repair below works from, and it opens the store `auditOnly`, which
+skips chunking the messages not yet in any chunk, a step a start takes before its check, so it
+can pass a store a start refuses: the host's audit is the one that opens it as a start's context
+does (agent-framework's own state in the store, which a start reads as well, is outside both). Repair a fresh copy of the stopped store, made the same way, never the store itself,
+since the repair and the drain write into it; from the copy on, the store stays as it was until
+the copy takes its place.
 `node …/dist/scripts/repair-topology.js <store-copy> --namespace agents/<agent> [--mode lossless|compact|rebuild] [--rebuild-since <messageId|ISO date>] [--apply]`
 is a dry run unless `--apply`; after `--apply` it reopens the copy under `reject` to verify.
 `lossless` (the default) only detaches, so the pyramid unravels around each fragment; `compact`
@@ -737,11 +758,21 @@ the same copy, or with a higher `--max-steps`. Then re-audit the copy with the `
 first audit used. The copy takes the store's place only when the repair with `--apply`, the
 drain's last run after a `rebuild`, and the re-audit each exited 0: read the repair's and the
 drain's output, then put the copy in the store's place, keep the original beside it untouched,
-and restart. Otherwise discard the copy; the store is as it was when you copied it. Two traps:
+and run the host's `--audit-stores` before you restart, since the audit and repair scripts open
+the copy `auditOnly`, which can pass a store a start refuses. Run it with the host's entry, the
+flag in place of the recipe, from the directory the host starts in, so a fleet entry's relative
+data directory resolves as the host's fleet resolves it: `bun <the host's src/index.ts> --audit-stores --recipe <recipe>
+<data directory>`, on the data directory whose store it is, with the recipe its start names. For a
+fleet child its parent's recipe names, run it on the parent's data directory with the parent's
+recipe, which audits the child as its fleet starts it; for a child launched by `fleet--launch`,
+on the child's own directory. It opens the stores in the directories it audits in place, so
+run it while a copy of those directories is kept. Restart only when it exits 0. If it doesn't, put the
+original back in the store's place. If a script doesn't exit 0, discard the copy; the store is
+as it was when you copied it. Two traps:
 (a) any `ContextManager.open` with a normal strategy config chunks the store's frontier under
-*that* config — verify only with the `auditOnly` scripts, never by opening a live store from a
-one-off script; (b) reflink/rsync copies of a *running* store read different state depending on
-when `state.bin` was last snapshotted — copy a stopped store.
+*that* config — verify only on a copy, with the host's audit or the `auditOnly` scripts, never
+by opening a live store from a one-off script; (b) reflink/rsync copies of a *running* store
+read different state depending on when `state.bin` was last snapshotted — copy a stopped store.
 
 **11.9 — `reasoning_extraction` refusals.** Anthropic's safety classifier can end a request
 with `stop_reason: refusal` and this category; it halts residents built from dense reasoning
@@ -787,26 +818,43 @@ blocks; expect folds to interact with this on the next model generation.
   adds the bounded error and its classification, and a call that got a response adds its summary
   (Bedrock, generic wrapper) or raw response (Anthropic, generic wrapper). A summary can be
   missing (`summaryUnavailable: true`, or dropped by the size cap below). Raw requests are kept
-  only where the writer's policy keeps them: Anthropic complete/stream on refusals, and on the
-  first failure of each kind of error (its type and HTTP status, or for an untyped error its
-  name) in a run of failures on a cache lineage, until a call on it succeeds or an hour passes
-  with no failed call on it, keepalive pokes counting for neither (later failures of that kind carry `requestSha256` and the request's size under `rawRequestOmitted`; the
-  latest 256 lineages' runs are remembered; at most 64 MiB of such copies per log, for the life of the process), or on every call with
+  only where the writer's policy keeps them: Anthropic complete/stream on refusals, on
+  anomalous responses (a client `tool_use` under any stop reason but `tool_use`, flagged by an
+  `anomaly` field and one `[llm-calls] … ANOMALY …` stderr line), and on the first failure of
+  each kind of error (its type and HTTP status, or for an untyped error its name) in a run of
+  failures on a cache lineage, until a call on it succeeds or an hour passes with no failed call
+  on it, keepalive pokes counting for neither (later failures of that kind carry `requestSha256`
+  and the request's size under `rawRequestOmitted`; the latest 256 lineages' runs are remembered;
+  at most 64 MiB of such copies per log, for the life of the process), or on every call with
   `LLM_CALLS_FULL_PAYLOADS=1`; Anthropic keepalive pokes only with that opt-in,
   whatever their outcome; Bedrock on errors; the generic wrapper on every call. Every line,
   newline included, is capped at 16 MiB of UTF-8: an oversized or unserializable record drops its
   raw request first, its raw response only if the line still doesn't fit, then its summaries, keeping at least its type, kind,
-  timing and error classification, and `truncated` says what was dropped. Treat the log as diagnostics, not as a
+  timing, error classification, `anomaly`, `messageId` and `requestId`, and `truncated` says what was dropped. Treat the log as diagnostics, not as a
   complete copy of any payload.
 - **Topology audit / repair (context-manager ≥ 0.12, §11.8):**
+  `bun src/index.ts --audit-stores [--recipe <recipe>] <data directory>` (exit 1 = some store
+  refused or not audited, a line on stderr for each store under each agent name it opens it under, or one for a store it doesn't open) opens every session's store and its
+  recipe's fleet children's in place, after a copy, as a start opens the agent's in it, but one
+  that reaches past what an update copies, of which it says why not, and one not there yet. A
+  load whose repair drops summaries holding text gets a line of its own, in the words of the
+  `memory-load-repair` ops alert, since the start that opens that store next finds nothing to
+  repair. The
+  script
   `node node_modules/@animalabs/context-manager/dist/scripts/audit-topology.js <store-copy> --namespace agents/<agent> --json`
-  (exit 2 = crossed), `node …/repair-topology.js <store-copy> --namespace agents/<agent> --mode lossless [--apply]`
+  (exit 2 = crossed) audits one copy `auditOnly`, which can pass a store a start refuses.
+  `node …/repair-topology.js <store-copy> --namespace agents/<agent> --mode lossless [--apply]`
   — on a fresh copy of the stopped store, never hardlinks; §11.8 gives the drain and the swap
 - **Health:** `GET /healthz` — per-agent `compressionQuarantine`, `compressionDebt` (incl.
   `topologyViolations` / `topologyRefusals`),
-  `contextComposition` (head / raw / summaries / tail as last rendered), `runtimeSettings`, and
-  `readFailures`, present only when one of those reads threw: by agent, then section, what the
-  error said, cut to 300 characters
+  `contextComposition` (head / raw / summaries / tail as the last live compile rendered them;
+  no entry for an agent with none, before its first live compile since its context was loaded
+  or for good where its strategy keeps none), `contextCompositionNotKept` (the names of the
+  agents whose strategy keeps none, present only when there are some), `runtimeSettings`,
+  `loadRepair` (the latest load repair this session that dropped summaries holding text, as
+  context-manager reported it; without `ops`, without its branch), and `readFailures`, present
+  only when one of those reads threw: by agent, then section, what the error said, cut to 300
+  characters
 - **Import guides:** [`claude-code-ingest.md`](./claude-code-ingest.md) ·
   [`claudeai-evacuation.md`](./claudeai-evacuation.md)
 - **Identity is the user's call. The mechanics are yours. Check everything. Be kind about who you're setting up.**

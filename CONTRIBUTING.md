@@ -56,18 +56,8 @@ the house default; plain descriptive titles are accepted.
   explicitly labeled as such, with a severity verdict and itemized findings.
 - The reviewer will typically **run your branch** (typecheck, test suite,
   loading a recipe) and paste transcripts. Claims are checked, not trusted.
-- **Greptile** reviews only PRs labelled `greptile` (`.greptile/config.json`).
-  A scheduled workflow adds that label to each open, non-draft PR whose
-  additions plus deletions pass 400 lines, unless it carries `no-greptile`,
-  and the review starts when the label lands: within about half an hour of
-  the PR opening, passing 400 lines or being marked ready, and later when
-  GitHub's scheduler is busy. A PR updated in the two minutes before a run
-  waits for a later one. A smaller PR gets a Greptile review if a maintainer
-  adds the label a minute or more after it's opened, reopened or marked
-  ready. A label added seven seconds after opening has twice started no
-  review, and Greptile's reference counts reopening and marking ready as
-  openings too. `no-greptile` skips the review. Removing `greptile` from a PR
-  past 400 lines doesn't skip it, since a later run adds the label back.
+- **Greptile** doesn't review new PRs. It reviews only PRs labelled
+  `greptile` (`.greptile/config.json`), so don't add that label to a new PR.
 - Respond by pushing fix commits and replying per finding — "Addressed in
   `<sha>`" — rather than force-pushing a rewritten branch. A re-review then
   flips the verdict.
@@ -140,7 +130,23 @@ never do.
   (subsections emitted in `### Breaking` / `### Added` / `### Changed` /
   `### Fixed` order), deletes the consumed fragments, keeps a fresh empty
   `Unreleased` above, and refuses to release when there is nothing to
-  release; npm then commits and tags. `git push --follow-tags` triggers the
+  release. It also writes the release's own fields into `package.json` as
+  `connectomeRelease`, which npm's full manifest of the version (what
+  `npm view` reads) keeps. `breaking` is whether anything is breaking since
+  the last final release below it in the changelog: the new section, or any
+  section between them, has a Breaking subsection with anything in it, as
+  `npm version`'s check of a pending breaking entry reads one.
+  `cacheWrite` is whether an update from that last final release changes
+  what each resident's requests carry before its newest turn, so that each
+  one's next request writes its prompt cache in full. Give it as
+  `RELEASE_CACHE_WRITE=yes@<version>` or `no@<version>`, naming the version
+  being cut; any other value is refused, and a cut nobody measured leaves it
+  unset and records nothing of its cost. When the hook refuses, npm has
+  already written the new version into `package.json` and
+  `package-lock.json` and leaves it there, so restore both
+  (`git checkout package.json package-lock.json`) before running
+  `npm version` again.
+  Otherwise npm commits and tags. `git push --follow-tags` triggers the
   publish workflow, which refuses a tag with no matching changelog section,
   builds the Web UI and checks in a job of its own that the packed release,
   which carries it in `dist/web`, installs and runs on its own
