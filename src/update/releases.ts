@@ -34,8 +34,11 @@ export interface Release {
   cacheWrite: boolean | null;
 }
 
-/** The registry the host reads, the one `npm` uses for the install
- *  (`npm_config_registry`), with a closing `/`. */
+/** The registry the host reads, with a closing `/`: the one
+ *  `npm_config_registry` names, else npm's own. A registry set only in an
+ *  `.npmrc`, such as a scoped `@animalabs:registry=`, isn't read, and the
+ *  read carries no token, so a mirror is named in the service's environment
+ *  for the notice to read it. */
 export function registryOf(env: Record<string, string | undefined> = process.env): string {
   const registry = env.npm_config_registry || DEFAULT_REGISTRY;
   return registry.endsWith('/') ? registry : `${registry}/`;
@@ -67,24 +70,43 @@ export function releasesOf(manifest: unknown): Release[] {
   return releases.sort((a, b) => Bun.semver.order(a.version, b.version));
 }
 
+/** `registry` as a message may name it: a user and password in it, which a
+ *  URL can carry, are left out, so a log or an answer never shows them. */
+export function shownRegistry(registry: string): string {
+  let url: URL;
+  try {
+    url = new URL(registry);
+  } catch {
+    return registry;
+  }
+  if (url.username === '' && url.password === '') return registry;
+  url.username = '';
+  url.password = '';
+  return url.toString();
+}
+
 /** Read the package's versions from `registry`, within `timeoutMs`. Throws
- *  with the reason when the manifest can't be read. */
+ *  with the reason when the manifest can't be read, naming the registry as
+ *  shownRegistry does, in its own words and in the reason's. */
 export async function readReleases(
   registry: string, fetchManifest: typeof fetch = fetch, timeoutMs: number = READ_TIMEOUT_MS,
 ): Promise<Release[]> {
   const url = `${registry}${PACKAGE.replace('/', '%2f')}`;
+  const shown = shownRegistry(registry);
+  const reason = (error: unknown): string =>
+    (error instanceof Error ? error.message : String(error)).split(registry).join(shown);
   let response: Response;
   try {
     response = await fetchManifest(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(timeoutMs) });
   } catch (error) {
-    throw new Error(`The registry at ${registry} couldn't be read: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(`The registry at ${shown} couldn't be read: ${reason(error)}`);
   }
-  if (!response.ok) throw new Error(`The registry at ${registry} answered ${response.status} for ${PACKAGE}.`);
+  if (!response.ok) throw new Error(`The registry at ${shown} answered ${response.status} for ${PACKAGE}.`);
   let manifest: unknown;
   try {
     manifest = await response.json();
   } catch (error) {
-    throw new Error(`The registry at ${registry} sent a manifest of ${PACKAGE} that isn't JSON: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(`The registry at ${shown} sent a manifest of ${PACKAGE} that isn't JSON: ${reason(error)}`);
   }
   return releasesOf(manifest);
 }

@@ -286,7 +286,11 @@ its fallback need: systemd's `Restart=on-failure` does.
 
 **Updating.**
 - **The notice:** the host reads npm's registry, or the one
-  `npm_config_registry` names, at start and once a day. When a newer release
+  `npm_config_registry` names in its environment, at start and once a day.
+  It doesn't read a registry set only in an `.npmrc`, and it sends no
+  token, so for a mirror, set `npm_config_registry` in the service's
+  environment; one that needs a token answers the read with its error,
+  which `/update` shows. When a newer release
   is out, its log, `/update` and the `update` section of `/healthz` say so,
   with what the releases since cost: which are breaking, which write each
   resident's prompt cache in full once, and which say nothing of their cost.

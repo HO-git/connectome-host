@@ -442,6 +442,40 @@ describe("a host's update, on a real start", () => {
     expect(hostModeRecord(join(dir, 'data'))).toMatchObject({ quiesced: true, reason: switchQuiesceReason('9.9.10') });
     expect(readCurrent(root)).toBe('9.9.9');
   }, 60_000);
+
+  // Readline mode needs a terminal, which util-linux's `script` gives it; macOS's
+  // `script` takes other arguments, so this runs on Linux alone.
+  test.skipIf(process.platform !== 'linux')(
+    '/update restart in readline mode, with the Web UI up, stops the process and leaves the mark (Linux only)', async () => {
+      const { dir, root, index } = install();
+      moveCurrent(root, '9.9.9');
+      const placed = join(root, 'releases', '9.9.10', 'node_modules', '@animalabs', 'connectome-host');
+      mkdirSync(join(placed, 'src', 'update'), { recursive: true });
+      writeFileSync(join(placed, 'package.json'), JSON.stringify({ version: '9.9.10' }));
+      writeFileSync(join(placed, 'src', 'index.ts'), '');
+      writeFileSync(join(placed, 'src', 'update', 'launcher.ts'), '');
+      const recipe = join(dir, 'recipe.json');
+      writeFileSync(recipe, JSON.stringify({ ...RECIPE, modules: { ...RECIPE.modules, webui: { host: '127.0.0.1', port: 0 } } }));
+      const env: Record<string, string | undefined> = {
+        ...process.env, ANTHROPIC_API_KEY: 'sk-test-update-commit', DATA_DIR: join(dir, 'data'), CONNECTOME_INSTALL_ROOT: root,
+      };
+      delete env.NO_UPDATE_NOTIFIER;
+      const quote = (word: string) => `'${word.replace(/'/g, `'\\''`)}'`;
+      const command = [process.execPath, index, recipe, '--no-tui'].map(quote).join(' ');
+      const host = spawn('script', ['-qfec', command, '/dev/null'], { cwd: dir, env, stdio: ['pipe', 'pipe', 'pipe'] });
+      hosts.push(host);
+      let out = '';
+      host.stdout!.on('data', (chunk) => { out += String(chunk); });
+      host.stderr!.on('data', (chunk) => { out += String(chunk); });
+      const exit = new Promise<number | null>((done) => host.once('close', (code) => done(code)));
+      await until(() => out.includes('connectome-host (readline mode)'), 30_000, `readline mode starts (output: ${out.slice(-1500)})`);
+      host.stdin!.write('/update restart\r');
+      // Its Web UI's server would keep the process, and with it the install's lock, if the stop left it up.
+      expect(await exit).toBe(0);
+      expect(out).toContain('Stopping to switch to 9.9.10: once it has stopped, start the host again, and that start does it.');
+      expect(readRecord<{ to: string; why: string }>(installPaths(root).mark, 'mark')).toMatchObject({ to: '9.9.10', why: 'update' });
+      expect(readCurrent(root)).toBe('9.9.9');
+    }, 60_000);
 });
 
 describe('a slash command in batch mode', () => {

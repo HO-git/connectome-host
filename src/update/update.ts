@@ -631,7 +631,12 @@ export function statusLines(status: UpdateStatus): string[] {
   }
   if (status.installing !== null) lines.push(`Installing ${status.installing}.`);
   else if (status.lastInstall?.ok === false) lines.push(`Installing ${status.lastInstall.version} failed: ${status.lastInstall.error}`);
-  if (status.installed !== null) lines.push(`${status.installed} is installed: /update restart switches to it.`);
+  if (status.installed !== null) {
+    // A release whose trial just ended before its commit is still in place, and a retry is the operator's to ask.
+    lines.push(status.lastSwitch?.outcome === 'fell-back' && status.lastSwitch.to === status.installed
+      ? `${status.installed} is installed, and ended before its commit at its last try: /update restart tries it again.`
+      : `${status.installed} is installed: /update restart switches to it.`);
+  }
   if (status.goBack !== null) {
     lines.push(`Going back to ${status.goBack.to} is offered, with the copy of its data taken ${status.goBack.since}: ` +
       '/update back says what each way does.');

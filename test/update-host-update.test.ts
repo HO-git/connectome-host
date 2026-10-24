@@ -846,6 +846,11 @@ test("/update's text names an install and a restart under way, and what's instal
   expect(statusLines(base)).toEqual(['connectome-host 0.12.1.', "The registry hasn't been read yet."]);
   expect(statusLines({ ...base, installing: '0.13.0', installed: '0.12.2' }).slice(2))
     .toEqual(['Installing 0.13.0.', '0.12.2 is installed: /update restart switches to it.']);
+  // One whose trial just ended before its commit is still installed, and a restart tries it again.
+  const fellBack = { outcome: 'fell-back', from: '0.12.1', to: '0.12.2', at: '2026-10-24T03:00:00.000Z', reason: '0.12.2 ended before its commit', trialLog: null } as const;
+  expect(statusLines({ ...base, installed: '0.12.2', lastSwitch: fellBack })).toContain(
+    '0.12.2 is installed, and ended before its commit at its last try: /update restart tries it again.');
+  expect(statusLines({ ...base, installed: '0.12.3', lastSwitch: fellBack })).toContain('0.12.3 is installed: /update restart switches to it.');
   const restart = { to: '0.13.0', why: 'update', keepData: false, hosts: [] } as const;
   expect(statusLines({ ...base, restart: { ...restart, phase: 'busy' } }).at(-1))
     .toBe('The restart to 0.13.0 is waiting on turns to end: /update restart wait, now or resume.');

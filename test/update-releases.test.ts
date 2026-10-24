@@ -4,7 +4,7 @@
  * offers, and the versions an update crosses.
  */
 import { describe, expect, test } from 'bun:test';
-import { DEFAULT_REGISTRY, candidateOf, rangeOf, readReleases, registryOf, releasesOf } from '../src/update/releases.js';
+import { DEFAULT_REGISTRY, candidateOf, rangeOf, readReleases, registryOf, releasesOf, shownRegistry } from '../src/update/releases.js';
 
 const manifest = {
   versions: {
@@ -64,6 +64,25 @@ describe('reading the registry', () => {
       .rejects.toThrow("sent a manifest of @animalabs/connectome-host that isn't JSON");
     await expect(readReleases('https://r.example/', (async () => { throw new Error('getaddrinfo ENOTFOUND'); }) as unknown as typeof fetch))
       .rejects.toThrow("The registry at https://r.example/ couldn't be read: getaddrinfo ENOTFOUND");
+  });
+
+  test("never names a registry's user or password, in its own words or in a failure's", async () => {
+    const secret = 'https://me:s3cret@r.example/npm/';
+    expect(shownRegistry(secret)).toBe('https://r.example/npm/');
+    expect(shownRegistry('https://me@r.example/npm/')).toBe('https://r.example/npm/');
+    expect(shownRegistry('https://r.example/npm/')).toBe('https://r.example/npm/');
+    expect(shownRegistry('not a url')).toBe('not a url');
+    // A failure that quotes the URL it was given is told without the secret too.
+    const quoting = (async (url: string) => { throw new Error(`fetch ${url} refused`); }) as unknown as typeof fetch;
+    const failed = await readReleases(secret, quoting).then(() => '', (error: Error) => error.message);
+    expect(failed).toStartWith('The registry at https://r.example/npm/ couldn\'t be read: fetch https://r.example/npm/');
+    expect(failed).not.toContain('s3cret');
+    const status = (async () => new Response('', { status: 401 })) as unknown as typeof fetch;
+    await expect(readReleases(secret, status)).rejects.toThrow('The registry at https://r.example/npm/ answered 401');
+    const garbled = (async () => new Response('not json', { status: 200 })) as unknown as typeof fetch;
+    const notJson = await readReleases(secret, garbled).then(() => '', (error: Error) => error.message);
+    expect(notJson).toStartWith('The registry at https://r.example/npm/ sent a manifest');
+    expect(notJson).not.toContain('s3cret');
   });
 
   test('gives up on a registry that answers nothing within its time', async () => {
