@@ -79,6 +79,7 @@ import { startFramework } from './start-framework.js';
 import { currentForStart, releaseHere, type ReleaseHere } from './update/host.js';
 import { childrenFilePath, trialPlaces } from './update/contract.js';
 import { hostUpdate, hostVersionOf } from './update/update.js';
+import { armTrialLog } from './update/trial-log.js';
 import { HOST_PACKAGE_JSON } from './bun-floor-check.js';
 import { switchSessionSteps } from './session-switch.js';
 import { resolveAgentName } from './agent-name.js';
@@ -1051,6 +1052,9 @@ async function main() {
   // started has to be one of that install's releases, or it refuses to start
   // (releaseHere).
   installHere = releaseHere();
+  // A release on trial keeps its last lines, for the release that falls back
+  // if it ends before its commit (src/update/trial-log.ts).
+  if (installHere !== null) armTrialLog(installHere);
   const recipe = await resolveRecipe();
   const provider = resolveProvider(recipe);
 

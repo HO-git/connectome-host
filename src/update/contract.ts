@@ -23,7 +23,8 @@
  * - the host: the mark (Restart, and its Go back), the fleet's children
  *   file, and the commit, which moves `current`. It appends the journal's
  *   `commit` line after it moves `current`, never before, so a `commit` line
- *   always means `current` moved;
+ *   always means `current` moved; and, on trial, the trial log, readable by
+ *   this user alone, if it exits before its commit (trial-log.ts);
  * - the launcher: every other journal line, the lock, the copy and its label,
  *   and what a restore sets aside; and, run from a shell with `--go-back`, a
  *   Go back's mark (writeMark);
@@ -38,8 +39,8 @@
  */
 import { randomUUID } from 'node:crypto';
 import {
-  closeSync, fsyncSync, lstatSync, openSync, readFileSync, readlinkSync, realpathSync, renameSync, symlinkSync,
-  truncateSync, unlinkSync, writeSync,
+  closeSync, fchmodSync, fsyncSync, lstatSync, openSync, readFileSync, readlinkSync, realpathSync, renameSync,
+  symlinkSync, truncateSync, unlinkSync, writeSync,
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 
@@ -91,6 +92,9 @@ export interface InstallPaths {
    *  (setAsideDir), kept, with a Go back's list of its places. A directory
    *  item's goes inside it (itemSetAsideDir). */
   setAside: string;
+  /** The last lines a release on trial wrote, if it exited before its commit
+   *  (TrialLog, trial-log.ts). */
+  trialLog: string;
 }
 
 export function installPaths(root: string): InstallPaths {
@@ -106,6 +110,7 @@ export function installPaths(root: string): InstallPaths {
     copyTmp: join(root, 'copy.tmp'),
     copyPrev: join(root, 'copy.prev'),
     setAside: join(root, 'set-aside'),
+    trialLog: join(root, 'trial-log.json'),
   };
 }
 
@@ -438,11 +443,13 @@ function writeAll(fd: number, text: string): void {
 /** Write `value` as JSON at `path` so that a reader sees the old file or the
  *  new one, never part of either: a temporary file, synced, renamed over it.
  *  Each file has one writer at a time, so the temporary file's name is fixed,
- *  and one a crash left is overwritten by the next write. */
-export function writeJsonAtomic(path: string, value: unknown): void {
+ *  and one a crash left is overwritten by the next write. Given `mode`, the
+ *  file gets that mode whatever a temporary file a crash left had. */
+export function writeJsonAtomic(path: string, value: unknown, mode?: number): void {
   const tmp = `${path}.tmp`;
-  const fd = openSync(tmp, 'w');
+  const fd = openSync(tmp, 'w', mode);
   try {
+    if (mode !== undefined) fchmodSync(fd, mode);
     writeAll(fd, `${JSON.stringify(value, null, 2)}\n`);
     fsyncSync(fd);
   } finally {

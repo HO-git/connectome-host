@@ -13,7 +13,7 @@
  */
 import { afterEach, describe, expect, test } from 'bun:test';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +25,7 @@ import {
   readRecord, switchQuiesceReason, writeJsonAtomic, type ChildrenFile,
 } from '../src/update/contract.js';
 import type { SwitchRequest } from '../src/update/quiesce.js';
+import { TRIAL_LOG_LINES, type TrialLog } from '../src/update/trial-log.js';
 import { hostModeRecord, writeHostModeRecord } from './host-mode-record.js';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -268,12 +269,16 @@ describe('a host started from an install', () => {
       '  }',
       '});',
     ].join('\n'));
-    const { stderr } = startHost(dir, index, root, {}, { mcpServers: { working: { command: process.execPath, args: [server] } } });
+    const { host, stderr, exit } = startHost(dir, index, root, {}, { mcpServers: { working: { command: process.execPath, args: [server] } } });
     // The journal's line comes just after the move.
     await until(() => readJournal(root).some(({ step }) => step === 'commit'), 30_000, `the trial commits (stderr: ${stderr().slice(-1500)})`);
     expect(readCurrent(root)).toBe('9.9.9');
     expect(stderr()).not.toContain("couldn't connect the MCPL server");
     expect(readJournal(root).map(({ step }) => step)).toEqual(['trial-start', 'commit']);
+    // Committed, it keeps no trial log: headless's SIGTERM ends it through process.exit, which runs exit handlers.
+    host.kill('SIGTERM');
+    await exit;
+    expect(existsSync(installPaths(root).trialLog)).toBe(false);
   }, 60_000);
 
   test("a trial whose MCPL server doesn't connect stops before its commit, and says which", async () => {
@@ -285,6 +290,13 @@ describe('a host started from an install', () => {
     expect(stderr()).toContain("This release couldn't connect the MCPL server lost, so it starts none of its agents, and the next start goes back to 9.9.8: ");
     expect(readCurrent(root)).toBe('9.9.8');
     expect(readJournal(root).map(({ step }) => step)).toEqual(['trial-start']);
+    // What it wrote as it ended is kept for the release that falls back, readable by this user alone.
+    const log = readRecord<TrialLog>(installPaths(root).trialLog, 'trial log');
+    expect(log).toMatchObject({ v: 1, release: '9.9.9', mark: 'm-1' });
+    expect(log!.lines.length).toBeGreaterThan(0);
+    expect(log!.lines.length).toBeLessThanOrEqual(TRIAL_LOG_LINES);
+    expect(log!.lines.some((line) => line.startsWith("Fatal error: Error: This release couldn't connect the MCPL server lost"))).toBe(true);
+    expect(statSync(installPaths(root).trialLog).mode & 0o777).toBe(0o600);
   }, 60_000);
 
   test('a host started on its own keeps no children file, though its fleet starts a child', async () => {

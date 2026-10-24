@@ -11,7 +11,8 @@ import { join } from 'node:path';
 import type { HostModeStatus } from '@animalabs/agent-framework';
 import { handleCommand } from '../src/commands.js';
 import {
-  appendJournal, copyLabelPath, installPaths, moveCurrent, readMark, realOrResolved, switchQuiesceReason, type CopyLabel,
+  appendJournal, copyLabelPath, installPaths, moveCurrent, readMark, realOrResolved, switchQuiesceReason, writeJsonAtomic,
+  type CopyLabel,
 } from '../src/update/contract.js';
 import type { InstallOps } from '../src/update/install.js';
 import { RELEASE_HOST } from '../src/update/launcher.js';
@@ -723,15 +724,36 @@ describe('the last switch', () => {
       .toContain("Last request: to 0.13.0, didn't go ahead at 2026-10-21T09:00:00.000Z: the copy failed: ENOSPC");
   });
 
-  test("a switch's fallback says what came back, and that the service's log has what the trial wrote", () => {
+  test("a switch's fallback says what came back, and where what the trial wrote is when it kept none", () => {
     const { root, dataDir } = install('0.12.1');
     appendJournal(root, { at: '2026-10-21T09:00:00.000Z', step: 'fallback', from: '0.13.0', to: '0.12.1', outcome: 'ok', reason: '0.13.0 ended before its commit', mark: 'm1' });
     const status = hostUpdate({ root, dataDir }).update.status();
     expect(status.lastSwitch).toEqual({
       outcome: 'fell-back', from: '0.12.1', to: '0.13.0', at: '2026-10-21T09:00:00.000Z', reason: '0.13.0 ended before its commit',
+      trialLog: null,
     });
     expect(statusLines(status)).toContain('Last switch: 0.13.0 ended before its commit, so 0.12.1 came back with its data ' +
-      "(2026-10-21T09:00:00.000Z): 0.13.0 ended before its commit. The service's log has what 0.13.0 wrote as it ended.");
+      "(2026-10-21T09:00:00.000Z): 0.13.0 ended before its commit. The service's log, or the terminal it was started in, has " +
+      'what 0.13.0 wrote as it ended.');
+  });
+
+  test("a switch's fallback shows the last lines its trial kept, and a trial log it can't read is a problem, not a lost fallback", () => {
+    const { root, dataDir } = install('0.12.1');
+    appendJournal(root, { at: '2026-10-21T09:00:00.000Z', step: 'fallback', from: '0.13.0', to: '0.12.1', outcome: 'ok', reason: '0.13.0 ended before its commit', mark: 'm1' });
+    const log = { v: 1, release: '0.13.0', mark: 'm1', lines: ['connecting lost', 'Fatal error: Error: no server'] };
+    writeJsonAtomic(installPaths(root).trialLog, log);
+    const status = hostUpdate({ root, dataDir }).update.status();
+    expect(status.lastSwitch).toMatchObject({ outcome: 'fell-back', trialLog: ['connecting lost', 'Fatal error: Error: no server'] });
+    const lines = statusLines(status);
+    const at = lines.indexOf('Last switch: 0.13.0 ended before its commit, so 0.12.1 came back with its data ' +
+      '(2026-10-21T09:00:00.000Z): 0.13.0 ended before its commit. What 0.13.0 wrote last, as it kept it (the service\'s ' +
+      'log, or the terminal it was started in, also has what this leaves out, such as an error Bun reported itself):');
+    expect(at).toBeGreaterThanOrEqual(0);
+    expect(lines.slice(at + 1, at + 3)).toEqual(['  connecting lost', '  Fatal error: Error: no server']);
+    writeJsonAtomic(installPaths(root).trialLog, { ...log, v: 2 });
+    const unread = hostUpdate({ root, dataDir }).update.status();
+    expect(unread.lastSwitch).toMatchObject({ outcome: 'fell-back', trialLog: null });
+    expect(unread.problems).toEqual([expect.stringContaining(`0.13.0's last lines: The trial log at ${installPaths(root).trialLog}`)]);
   });
 });
 

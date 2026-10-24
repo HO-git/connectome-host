@@ -35,6 +35,7 @@ import {
   quiesceForSwitch, resumeAfterSwitchQuiesce, type HostQuiet, type QuiesceFramework, type SwitchFleet,
 } from './quiesce.js';
 import { candidateOf, rangeOf, readReleases, registryOf, type Release } from './releases.js';
+import { readTrialLog } from './trial-log.js';
 
 /** How often a running host reads the registry again. */
 const CHECK_EVERY_MS = 24 * 60 * 60 * 1000;
@@ -104,10 +105,12 @@ export interface ReadCheck {
 /** The last read of the registry. */
 export type Check = ReadCheck | { at: string; ok: false; error: string };
 
-/** How the last switch or Go back ended, by the journal. */
+/** How the last switch or Go back ended, by the journal. A fallback carries
+ *  the last lines the failed release kept itself (trial-log.ts), or null when
+ *  it kept none. */
 export type SwitchOutcome =
   | { outcome: 'committed'; from: string; to: string; at: string }
-  | { outcome: 'fell-back'; from: string; to: string; at: string; reason: string }
+  | { outcome: 'fell-back'; from: string; to: string; at: string; reason: string; trialLog: string[] | null }
   | { outcome: 'refused'; step: string; from: string; to: string; at: string; reason: string };
 
 export interface RestartState {
@@ -360,7 +363,7 @@ export class HostUpdate {
       operatorQuiesced: quiesced?.quiesced && !isSwitchQuiesce(quiesced.reason) ? quiesced.reason ?? 'no reason given' : null,
       // A fleet child's switch quiesce is its parent's restart's.
       switchQuiesceLeft: here !== null && quiesced?.quiesced === true && isSwitchQuiesce(quiesced.reason) && this.restart === null,
-      lastSwitch: here === null ? null : read('the last switch', () => lastSwitchOf(here.root)),
+      lastSwitch: here === null ? null : read('the last switch', () => lastSwitchOf(here.root, problems)),
       problems,
     };
   }
@@ -645,8 +648,16 @@ export function statusLines(status: UpdateStatus): string[] {
   if (last?.outcome === 'committed') lines.push(`Last switch: ${last.from} to ${last.to}, committed at ${last.at}.`);
   if (last?.outcome === 'refused') lines.push(`Last request: to ${last.to}, didn't go ahead at ${last.at}: ${last.reason}`);
   if (last?.outcome === 'fell-back') {
-    lines.push(`Last switch: ${last.to} ended before its commit, so ${last.from} came back with its data (${last.at}): ` +
-      `${last.reason}. The service's log has what ${last.to} wrote as it ended.`);
+    const head = `Last switch: ${last.to} ended before its commit, so ${last.from} came back with its data (${last.at}): ` +
+      `${last.reason}.`;
+    if (last.trialLog === null || last.trialLog.length === 0) {
+      lines.push(`${head} The service's log, or the terminal it was started in, has what ${last.to} wrote as it ` +
+        'ended.');
+    } else {
+      lines.push(`${head} What ${last.to} wrote last, as it kept it (the service's log, or the terminal it was started ` +
+        'in, also has what this leaves out, such as an error Bun reported itself):',
+      ...last.trialLog.map((line) => `  ${line}`));
+    }
   }
   return [...lines, ...status.problems];
 }
@@ -677,14 +688,23 @@ export function goBackLines(status: UpdateStatus): string[] {
 // ---------------------------------------------------------------------------
 
 /** How the journal's last request ended: committed, fallen back, or not gone
- *  ahead (a refusal, or a step that failed). */
-export function lastSwitchOf(root: string): SwitchOutcome | null {
+ *  ahead (a refusal, or a step that failed). A trial log that can't be read
+ *  is named in `problems`, and the fallback is given without its lines. */
+export function lastSwitchOf(root: string, problems: string[] = []): SwitchOutcome | null {
   const lines = readJournal(root);
   for (let at = lines.length - 1; at >= 0; at--) {
     const line = lines[at]!;
     if (line.step === 'commit' && line.outcome === 'ok') return { outcome: 'committed', from: line.from, to: line.to, at: line.at };
     if (line.step === 'fallback' && line.outcome === 'ok') {
-      return { outcome: 'fell-back', from: line.to, to: line.from, at: line.at, reason: line.reason ?? 'it gave no reason' };
+      let trialLog: string[] | null = null;
+      try {
+        trialLog = readTrialLog(root, line);
+      } catch (error) {
+        problems.push(`${line.from}'s last lines: ${said(error)}`);
+      }
+      return {
+        outcome: 'fell-back', from: line.to, to: line.from, at: line.at, reason: line.reason ?? 'it gave no reason', trialLog,
+      };
     }
     if (line.outcome !== 'ok') {
       return { outcome: 'refused', step: line.step, from: line.from, to: line.to, at: line.at, reason: line.reason ?? 'it gave no reason' };

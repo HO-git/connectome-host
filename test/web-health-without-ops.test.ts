@@ -181,6 +181,19 @@ describe("the update section, with health and without ops", () => {
     });
   });
 
+  test("a fallback keeps its versions and time, and empties the lines its trial kept", () => {
+    const fellBack: UpdateStatus = {
+      ...update,
+      lastSwitch: {
+        outcome: 'fell-back', from: '0.12.1', to: '0.12.2', at: '2026-10-21T09:00:00.000Z', reason: '0.12.2 ended before its commit',
+        trialLog: ['Fatal error: Error: ANTHROPIC_API_KEY sk-ant-xyz was refused'],
+      },
+    };
+    expect(sent({ update: fellBack }, HEALTH_STRINGS).update.lastSwitch).toEqual({
+      outcome: 'fell-back', from: '0.12.1', to: '0.12.2', at: '2026-10-21T09:00:00.000Z', reason: '', trialLog: [''],
+    });
+  });
+
   test("a read that failed keeps its time and empties its error", () => {
     const failed: UpdateStatus = { ...update, check: { at: '2026-10-22T12:00:00.000Z', ok: false, error: 'getaddrinfo ENOTFOUND registry.internal.example' } };
     expect(sent({ update: failed }, HEALTH_STRINGS).update.check).toEqual({ at: '2026-10-22T12:00:00.000Z', ok: false, error: '' });

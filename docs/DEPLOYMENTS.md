@@ -312,8 +312,13 @@ its fallback need: systemd's `Restart=on-failure` does.
   again.
 - **A release that ends before its commit** is undone at the next start: the
   copy is restored, what the new release changed is kept aside, and the
-  release before starts. `/update` then says why, and the service's log has
-  what the new release wrote as it ended.
+  release before starts. `/update` then says why, and shows the last 40
+  lines the new release wrote through its console and its stdout and stderr,
+  which it kept itself in `trial-log.json` in the install root. The service's
+  log, or the terminal a host started by hand ran in, has what those leave
+  out: an error Bun reported itself, everything from a release a signal
+  ended (a stop, or the OOM killer) or whose code didn't load, and what its
+  servers' processes wrote.
 - **What each update copies:** the data directory, each fleet child's data
   directory, the MCPL settings files in the working directory, and the
   state setup recorded. A fleet child given `.` as its data directory makes
