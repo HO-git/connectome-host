@@ -409,3 +409,20 @@ test("a cancelled call keeps no copy and leaves its lineage's run as it was", as
     setSystemTime();
   }
 });
+
+test("a repeat's note names its run's copy of that kind by hash, which is that copy's record's requestSha256", async () => {
+  const adapter = newAdapter();
+  const turn = async (content: string, err: unknown) => {
+    failWith(err, ofLineage('a', content));
+    return (await errorRecords('stream', 1, adapter)).at(-1)!;
+  };
+  const firstLimit = await turn('turn 1', rateLimitError('429'));
+  const firstOverload = await turn('turn 2', serverError('529 overloaded', 529));
+  const limitNote = await turn('turn 3', rateLimitError('429'));
+  const overloadNote = await turn('turn 4', serverError('529 overloaded', 529));
+  expect(firstLimit.requestSha256).toBe(sha(ofLineage('a', 'turn 1')));
+  expect(limitNote.requestSha256).toBe(sha(ofLineage('a', 'turn 3')));
+  expect(limitNote.rawRequestOmitted).toMatchObject({ copySha256: firstLimit.requestSha256 });
+  expect(overloadNote.rawRequestOmitted).toMatchObject({ copySha256: firstOverload.requestSha256 });
+  expect((limitNote.rawRequestOmitted as { reason: string }).reason).toContain('copySha256');
+});

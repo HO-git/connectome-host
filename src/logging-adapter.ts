@@ -166,12 +166,14 @@ const FAILED_REQUEST_COPY_REFILL_MS = 24 * 60 * 60 * 1000;
 const FAILING_RUN_GAP_MS = 60 * 60 * 1000;
 
 /** A failing request written in full: its lineage's run, its kind of error,
- *  and its size against the budget. */
-type Written = { lineage: string | undefined; kind: string; bytes: number };
+ *  its size against the budget, and its hash, which the run's later notes
+ *  of that kind name as their copy. */
+type Written = { lineage: string | undefined; kind: string; bytes: number; requestSha256: string };
 
-/** A lineage's run of failures: the kinds of error whose first failing
- *  request it has written in full, and when it last failed. */
-type FailingRun = { kinds: Set<string>; lastFailureAt: number };
+/** A lineage's run of failures: for each kind of error whose first failing
+ *  request it has written in full, that request's hash, and when it last
+ *  failed. */
+type FailingRun = { kinds: Map<string, string>; lastFailureAt: number };
 
 /** The kind of failure a run keeps one copy of: membrane's error type and
  *  the HTTP status, since membrane types every 5xx as `server` (a 500 can be
@@ -786,7 +788,8 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
    *  that kind, and any whose request the log's budget for failing requests
    *  (FAILED_REQUEST_COPY_BUDGET, refilled over FAILED_REQUEST_COPY_REFILL_MS)
    *  has no room for now, record the request's size in `rawRequestOmitted`
-   *  instead, as a cancelled call (membrane's `abort`) always does, since a
+   *  instead (a repeat with its run's copy's hash, `copySha256`, which is
+   *  that copy's record's `requestSha256`), as a cancelled call (membrane's `abort`) always does, since a
    *  cancellation is never the request's doing; it leaves its lineage's run
    *  as it was. A request with no lineage is held to the budget alone. Each
    *  record with a request carries `requestSha256`, so identical requests
@@ -815,10 +818,13 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     });
     if (aborted) return omitted('a cancelled call (membrane types it `abort`) is never the request\'s doing');
     const run = lineage === undefined ? undefined : this.failingRun(lineage);
-    if (run?.kinds.has(kind)) {
-      return omitted('this lineage has failed with this kind of error (its type and HTTP status, or for an untyped '
+    const copySha256 = run?.kinds.get(kind);
+    if (copySha256 !== undefined) {
+      const note = omitted('this lineage has failed with this kind of error (its type and HTTP status, or for an untyped '
         + 'error its name) since a call on it last succeeded, with no hour between its failures, and an earlier error '
-        + 'record in this log has the first such request in full, unless the file was rotated since');
+        + 'record in this log, whose requestSha256 is copySha256, has the first such request in full, unless the file '
+        + 'was rotated since');
+      return { fields: { ...note.fields, rawRequestOmitted: { ...note.fields.rawRequestOmitted, copySha256 } } };
     }
     if (bytes > this.failedCopyRoomNow()) {
       this.tellBudgetRefusal();
@@ -827,7 +833,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     }
     // Noted only once its record is written whole: a record the line bound cut
     // has no copy, so the run's next failure of the kind tries again.
-    return { fields: { rawRequest, requestSha256 }, remember: { lineage, kind, bytes } };
+    return { fields: { rawRequest, requestSha256 }, remember: { lineage, kind, bytes, requestSha256 } };
   }
 
   /** A lineage's run, if one is going on: one whose last failure is older
@@ -875,16 +881,16 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
   /** Notes a failing request as written in full: its bytes against the
    *  budget, and its kind in its lineage's run. A run keeps its place from
    *  when it began, for the oldest-first bound. */
-  private rememberFailedRequest({ lineage, kind, bytes }: Written): void {
+  private rememberFailedRequest({ lineage, kind, bytes, requestSha256 }: Written): void {
     this.failedCopyRoom = this.failedCopyRoomNow() - bytes;
     this.budgetRefusalTold = false;
     if (lineage === undefined) return;
     const run = this.failingRuns.get(lineage);
     if (run) {
-      run.kinds.add(kind);
+      run.kinds.set(kind, requestSha256);
       return;
     }
-    this.failingRuns.set(lineage, { kinds: new Set([kind]), lastFailureAt: Date.now() });
+    this.failingRuns.set(lineage, { kinds: new Map([[kind, requestSha256]]), lastFailureAt: Date.now() });
     if (this.failingRuns.size > FAILING_RUNS_REMEMBERED) {
       this.failingRuns.delete(this.failingRuns.keys().next().value as string);
     }
