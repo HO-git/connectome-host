@@ -606,9 +606,9 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
         cacheTtls: cache.ttls,
         lineage: call.key,
       },
-      // A poke replays its lineage's latest real request every refresh
-      // interval, so a row keeps it only with full payloads on, failed and
-      // refused pokes' rows included. A turn's refused row keeps its own, and
+      // A poke replays a request derived from its lineage's latest one the
+      // provider began answering, every refresh interval, so a row keeps it
+      // only with full payloads on, failed and refused pokes' rows included. A turn's refused row keeps its own, and
       // so does its failed row when it's its run's first of its kind.
       rawRequest: this.fullPayloads ? raw : undefined,
       ...(response ? { rawResponse: response } : {}),
@@ -892,11 +892,9 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
 
   /** A call's success on a lineage, a turn's or complete()'s, ends its run
    *  of failures, and only its own: one adapter serves every caller. A
-   *  keepalive poke's doesn't. A poke replays the lineage's latest request
-   *  membrane recorded, with max_tokens 0 and no stream, and membrane records
-   *  a request only once its own checks pass: after a request it refused
-   *  before sending, such as an unsupported prefill, a poke replays an
-   *  earlier one, and can succeed while every call is refused. */
+   *  keepalive poke's doesn't: a poke replays a request derived from the
+   *  lineage's latest one the provider began answering, with max_tokens 0
+   *  and no stream, so it can succeed while every new call fails. */
   private endFailingRun(lineage: unknown): void {
     if (typeof lineage === 'string') this.failingRuns.delete(lineage);
   }
