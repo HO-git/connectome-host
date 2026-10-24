@@ -5,6 +5,7 @@
  * with the registry, the package manager and the framework stood in for.
  */
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import * as fs from 'node:fs';
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -168,6 +169,28 @@ const field = (breaking: boolean | undefined, cacheWrite?: boolean) =>
 test("the suite runs with the notice off, so the hosts its tests start don't read npm's registry (bunfig.toml)", () => {
   expect(process.env.CONNECTOME_UPDATE_CHECK).toBe('0');
 });
+
+
+/** Make the first directory sync after a rename onto `path` fail, as a disk
+ *  might once the rename has put the file in place. */
+function failSyncAfterRenameTo(path: string) {
+  const rename = fs.renameSync;
+  const fsync = fs.fsyncSync;
+  let renamed = false;
+  return [
+    spyOn(fs, 'renameSync').mockImplementation((from: fs.PathLike, to: fs.PathLike) => {
+      rename(from, to);
+      if (String(to) === path) renamed = true;
+    }),
+    spyOn(fs, 'fsyncSync').mockImplementation((fd: number) => {
+      if (renamed && fs.fstatSync(fd).isDirectory()) {
+        renamed = false;
+        throw new Error('EIO: i/o error, fsync');
+      }
+      fsync(fd);
+    }),
+  ];
+}
 
 describe('the notice', () => {
   test('offers the newest final release that is neither deprecated nor older, with what each version since costs', async () => {
@@ -375,8 +398,9 @@ describe('Restart', () => {
     expect(update.status().switchQuiesceLeft).toBe(false);
     expect((await update.restartToInstalled()).lines).toEqual([expect.stringContaining('is waiting on turns to end')]);
     const waiting = update.waitLonger();
-    // Quiescing again, it shows no busy list from before.
+    // Quiescing again, it shows no busy list from before, and its wait hasn't run out.
     expect(update.status().restart).toMatchObject({ phase: 'quiescing', hosts: [] });
+    expect((await update.stopNow()).lines).toEqual(["No restart's wait for turns to end has run out, so there is nothing to wait longer for or stop now."]);
     expect((await waiting).done).toBe(false);
     const resumed = await update.resume();
     expect(resumed).toEqual({ done: true, lines: ['The restart to 0.13.0 is called off, and nothing switches.'] });
@@ -407,8 +431,8 @@ describe('Restart', () => {
     let release: () => void = () => {};
     const { framework } = fakeFramework({ held: new Promise<void>((done) => { release = done; }) });
     const { update } = hostUpdate({ root, dataDir, framework }, { supervised: true });
-    expect(await update.waitLonger()).toEqual({ done: false, lines: ['No restart is waiting on turns to end.'] });
-    expect(await update.stopNow()).toEqual({ done: false, lines: ['No restart is waiting on turns to end.'] });
+    expect(await update.waitLonger()).toEqual({ done: false, lines: ["No restart's wait for turns to end has run out, so there is nothing to wait longer for or stop now."] });
+    expect(await update.stopNow()).toEqual({ done: false, lines: ["No restart's wait for turns to end has run out, so there is nothing to wait longer for or stop now."] });
     const first = update.restartToInstalled();
     expect((await update.restartToInstalled()).lines).toEqual(["A restart to 0.13.0 is waiting for turns to end, with new turns held."]);
     expect((await update.goBack(true)).lines).toEqual(["A restart to 0.13.0 is waiting for turns to end, with new turns held."]);
@@ -439,8 +463,8 @@ describe('Restart', () => {
     const resuming = update.resume();
     await resumeAsked;
     expect(update.status().restart).toMatchObject({ phase: 'ending' });
-    expect(await update.stopNow()).toEqual({ done: false, lines: ['No restart is waiting on turns to end.'] });
-    expect(await update.waitLonger()).toEqual({ done: false, lines: ['No restart is waiting on turns to end.'] });
+    expect(await update.stopNow()).toEqual({ done: false, lines: ["No restart's wait for turns to end has run out, so there is nothing to wait longer for or stop now."] });
+    expect(await update.waitLonger()).toEqual({ done: false, lines: ["No restart's wait for turns to end has run out, so there is nothing to wait longer for or stop now."] });
     expect((await update.restartToInstalled()).lines).toEqual(["A restart to 0.13.0 is being called off, ending the switch's quiesce."]);
     release();
     expect(await resuming).toEqual({ done: true, lines: ['The restart to 0.13.0 is called off, and nothing switches.'] });
@@ -492,7 +516,15 @@ describe('Restart', () => {
     expect(await failing.resume()).toEqual({ done: false, lines: [
       "No restart is waiting, and the switch's quiesce couldn't be ended.",
       expect.stringMatching(/^this host: it stays quiesced, since agent-framework refused its resume \(it would wedge\)/),
-      "For a host still quiesced, /update restart resume tries again, and the host's next start ends the switch's quiesce.",
+      "For a host still quiesced, /update restart resume tries again, as does the host's next start.",
+    ] });
+    // Ended on one host and not another, it says both.
+    const kid: SwitchFleet = { runningChildren: () => [{ name: 'kid' }], requestSwitch: async () => ({ ok: true, data: { resumed: true } }) };
+    const partly = hostUpdate({ root, dataDir, framework: stuck.framework, fleet: kid }, { supervised: true }).update;
+    expect(await partly.resume()).toEqual({ done: false, lines: [
+      "The switch's quiesce is ended on kid, but not on every host.",
+      expect.stringMatching(/^this host: it stays quiesced, since agent-framework refused its resume \(it would wedge\)/),
+      "For a host still quiesced, /update restart resume tries again, as does the host's next start.",
     ] });
     // A fleet child has no restart of its own: its parent's quiesce isn't one left standing.
     expect(hostUpdate({ framework: stuck.framework }).update.status().switchQuiesceLeft).toBe(false);
@@ -559,7 +591,7 @@ describe('Restart', () => {
           'such as try later or the next start, can succeed once that is resolved.',
         "busy: it's serving, though agent-framework's resume failed after the quiesce ended: EIO.",
         'gone: its socket closed.',
-        "For a host still quiesced, /update restart resume tries again, and the host's next start ends the switch's quiesce.",
+        "For a host still quiesced, /update restart resume tries again, as does the host's next start.",
       ],
     });
   });
@@ -576,6 +608,27 @@ describe('Restart', () => {
     expect(calls).toEqual(['quiesce', 'resume']);
     expect(stops).toEqual([]);
     expect(update.status().restart).toBeNull();
+  });
+
+  test("a mark in place whose sync fails still stops the host, and the farewell names the failed sync", async () => {
+    const { root, dataDir } = install('0.12.1', ['0.13.0']);
+    const { framework, calls } = fakeFramework();
+    const { update, stops } = hostUpdate({ root, dataDir, framework }, { supervised: true });
+    // The directory's sync fails, after the rename has put the mark in place.
+    const spies = failSyncAfterRenameTo(installPaths(root).mark);
+    let answer;
+    try {
+      answer = await update.restartToInstalled();
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+    const farewell = "Stopping to switch to 0.13.0: the host's next start does it, which a service set up for updates makes by " +
+      'itself. The request is written, though syncing it to the disk failed (EIO: i/o error, fsync), so a power cut could ' +
+      'still undo it.';
+    expect(answer).toEqual({ done: true, lines: [farewell] });
+    expect(readMark(root)).toMatchObject({ to: '0.13.0', why: 'update' });
+    expect(calls).toEqual(['quiesce']);
+    expect(stops).toEqual([{ reason: 'update: switch to 0.13.0', farewell }]);
   });
 
   test("a quiesce that throws calls the restart off and resumes, with no mark", async () => {
@@ -735,6 +788,11 @@ describe('the last switch', () => {
     expect(statusLines(status)).toContain('Last switch: 0.13.0 ended before its commit, so 0.12.1 came back with its data ' +
       "(2026-10-21T09:00:00.000Z): 0.13.0 ended before its commit. The service's log, or the terminal it was started in, has " +
       'what 0.13.0 wrote as it ended.');
+    // One it kept with no lines says the same.
+    writeJsonAtomic(installPaths(root).trialLog, { v: 1, release: '0.13.0', mark: 'm1', lines: [] });
+    const empty = hostUpdate({ root, dataDir }).update.status();
+    expect(empty.lastSwitch).toMatchObject({ outcome: 'fell-back', trialLog: [] });
+    expect(statusLines(empty)).toContain(statusLines(status).find((line) => line.startsWith('Last switch: '))!);
   });
 
   test("a switch's fallback shows the last lines its trial kept, and a trial log it can't read is a problem, not a lost fallback", () => {

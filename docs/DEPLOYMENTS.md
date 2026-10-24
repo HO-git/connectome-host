@@ -313,10 +313,11 @@ its fallback need: systemd's `Restart=on-failure` does.
 - **A release that ends before its commit** is undone at the next start: the
   copy is restored, what the new release changed is kept aside, and the
   release before starts. `/update` then says why, and shows the last 40
-  lines the new release wrote through its console and its stdout and stderr,
-  which it kept itself in `trial-log.json` in the install root. The service's
-  log, or the terminal a host started by hand ran in, has what those leave
-  out: an error Bun reported itself, everything from a release a signal
+  lines the new release wrote through console's `log`, `info`, `warn`,
+  `error` and `debug` and to its stdout and stderr, which it kept itself in
+  `trial-log.json` in the install root. The service's log, or the terminal
+  a host started by hand ran in, has what those leave out: console's other
+  methods, an error Bun reported itself, everything from a release a signal
   ended (a stop, or the OOM killer) or whose code didn't load, and what its
   servers' processes wrote.
 - **What each update copies:** the data directory, each fleet child's data
@@ -341,7 +342,9 @@ its fallback need: systemd's `Restart=on-failure` does.
   --go-back`, with `--keep-data` to keep the newer data. It waits up to a
   minute for the host to give up the install's lock, which one that keeps
   exiting does between starts, writes the request, and the service's next
-  start goes back. If the service isn't running, start it.
+  start goes back. If the service isn't running, start it. A release that
+  stays up longer than a minute before each exit can hold the lock through
+  the wait: stop the service, run the command, and start the service.
 
 **By hand.** An install of the published package (`npm install
 @animalabs/connectome-host`, or `bun add`) changes version only when npm or

@@ -35,7 +35,7 @@ import {
   ContractError, ENTRY_POINT, INSTALL_ROOT_ENV, ITEM_UPDATE_DIR, appendJournal, childrenFilePath,
   copyItemName, copyLabelPath, goBackListPath, installPaths, isChildEntry, itemSetAsideDir, lastCopy, pendingGoBack,
   readCurrent, readGoBackList, readJournal, readMark, readRecord, realOrResolved, releaseDir, setAsideDir,
-  unfinishedTrial, writeJsonAtomic, writeMark,
+  unfinishedTrial, unsyncedText, writeJsonAtomic, writeMark,
   type ChildrenFile, type CopyLabel, type GoBackList, type InstallRecord, type JournalLine, type LockRecord, type Mark,
   type PlaceKind,
 } from './contract.js';
@@ -854,8 +854,8 @@ function refuse(root: string, ops: LauncherOps, step: JournalLine['step'], curre
   try {
     if (!existsSync(markPath)) syncPath(root);
   } catch (error) {
-    dropped += ` Syncing its removal failed (${errorText(error)}), so after a power cut the mark could stand again, and ` +
-      'the next start would try the request once more.';
+    dropped += ` Syncing its removal failed (${errorText(error)}), so a power cut could bring the mark back, for the ` +
+      'next start to try the request once more.';
   }
   ops.report(`[update] The ${what} to ${mark.to} didn't go ahead, so ${current} starts as it was: ` +
     `${reason.replace(/\.+$/, '')}. ${dropped}`);
@@ -1416,7 +1416,7 @@ export function goBackFromShell(root: string, args: string[], ops: LauncherOps):
       if (ops.now().getTime() >= until) {
         ops.report(`[update] Nothing was asked for: this install's lock has been held for the last ` +
           `${GO_BACK_LOCK_WAIT_MS / 1000} s. ${errorText(error)} A host that's up goes back with \`/update back\`, ` +
-          'which lets its turns end first.');
+          'which lets its turns end first. Otherwise stop the service, run this again, and start the service.');
         return 1;
       }
       if (!waiting) {
@@ -1448,12 +1448,13 @@ export function goBackFromShell(root: string, args: string[], ops: LauncherOps):
     } catch {
       standing = 'a release this release can\'t read';
     }
-    const mark = writeMark(root, { to: offer.to, why: 'go-back', keepData }, ops.now());
+    const { mark, unsynced } = writeMark(root, { to: offer.to, why: 'go-back', keepData }, ops.now());
     ops.report(`[update] The next start goes back to ${offer.to}, ` +
       (keepData ? 'keeping the newer data' : `restoring the copy of its data taken ${offer.since}, with what ` +
         'changed since kept aside') +
       (standing !== null ? `. This replaces the request to ${standing} that stood` : '') +
-      `. Start the service if it isn't running, and it goes back as it starts (mark ${mark.id}).`);
+      `. Start the service if it isn't running, and it goes back as it starts (mark ${mark.id}).` +
+      (unsynced !== null ? ` ${unsyncedText(unsynced)}` : ''));
     return 0;
   } catch (error) {
     ops.report(`[update] Nothing was asked for: ${errorText(error)}`);

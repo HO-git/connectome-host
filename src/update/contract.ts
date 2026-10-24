@@ -705,12 +705,14 @@ export function readMark(root: string): Mark | null {
  *  standing. Its writer then stops the host (Restart), or tells the operator
  *  to start the service (the launcher's --go-back). A write that throws once
  *  its rename has put the mark in place, as when syncing the directory fails,
- *  has still asked: the mark is returned, since the next start reads it. A
- *  power cut that loses the unsynced entry leaves the release that ran, whose
- *  start then ends the switch's quiesce. `write` is a test's seam. */
+ *  has still asked: the mark is returned, since the next start reads it, with
+ *  that error as `unsynced`, which its writer tells the operator. A power cut
+ *  that loses the unsynced entry leaves what stood before the write: no
+ *  request, so the release that ran starts and ends the switch's quiesce, or
+ *  the request this one replaced. `write` is a test's seam. */
 export function writeMark(
   root: string, request: Pick<Mark, 'to' | 'why' | 'keepData'>, now: Date = new Date(), write = writeJsonAtomic,
-): Mark {
+): { mark: Mark; unsynced: Error | null } {
   const mark: Mark = {
     v: 1, id: randomUUID(), to: segment(request.to, 'release'), why: request.why, at: now.toISOString(),
     ...(request.keepData ? { keepData: true } : {}),
@@ -723,11 +725,23 @@ export function writeMark(
     try {
       standing = readRecord<Mark>(path, 'mark');
     } catch {
-      // What can't be read isn't this write's mark, which went in whole.
+      // A file that isn't a record isn't this write's mark, which went in
+      // whole. One that can't be read at all is taken as not this write's
+      // either: reading a file this process has just renamed into place, its
+      // own descriptor closed, fails only on a filesystem that's failing.
     }
     if (standing?.id !== mark.id) throw error;
+    return { mark, unsynced: error instanceof Error ? error : new Error(String(error)) };
   }
-  return mark;
+  return { mark, unsynced: null };
+}
+
+/** What a mark's writer tells the operator when its write threw once the mark
+ *  was in place (writeMark's `unsynced`): the request stands, and may not
+ *  survive a power cut. */
+export function unsyncedText(error: Error): string {
+  return `The request is written, though syncing it to the disk failed (${error.message.replace(/\.+$/, '')}), so a ` +
+    'power cut could still undo it.';
 }
 
 /** The switch's copy, as its label says: the release whose data it holds,

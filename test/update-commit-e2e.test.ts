@@ -276,8 +276,11 @@ describe('a host started from an install', () => {
     expect(stderr()).not.toContain("couldn't connect the MCPL server");
     expect(readJournal(root).map(({ step }) => step)).toEqual(['trial-start', 'commit']);
     // Committed, it keeps no trial log: headless's SIGTERM ends it through process.exit, which runs exit handlers.
+    // Its handlers go on just after its socket listens, so a SIGTERM before then would end it with none run.
+    const log = join(dir, 'data', 'headless.log');
+    await until(() => existsSync(log) && readFileSync(log, 'utf-8').includes('socket listening at'), 30_000, 'headless listens');
     host.kill('SIGTERM');
-    await exit;
+    expect(await exit).toBe(0);
     expect(existsSync(installPaths(root).trialLog)).toBe(false);
   }, 60_000);
 

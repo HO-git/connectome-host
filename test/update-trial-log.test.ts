@@ -76,7 +76,28 @@ describe('a release on trial', () => {
     expect(statSync(installPaths(root).trialLog).mode & 0o777).toBe(0o600);
   });
 
+  test("keeps each of console's five methods it wraps, a subarray's own bytes, and passes a write's encoding and callback on", () => {
+    const root = install();
+    const { status, stdout, stderr } = run(root, [
+      "console.info('info');",
+      "console.warn('warn');",
+      "console.debug('debug');",
+      "process.stdout.write(new TextEncoder().encode('[around]').subarray(1, 7));",
+      // Bun can call the callback within the write, before it returns.
+      'let calledBack = false;',
+      "const returned = process.stdout.write('\\nwith a callback\\n', 'utf-8', () => { calledBack = true; });",
+      "setTimeout(() => { process.stderr.write(JSON.stringify({ calledBack, returned }) + '\\n'); process.exit(1); }, 10);",
+    ].join('\n'));
+    expect(status).toBe(1);
+    expect(stdout).toContain('around\nwith a callback\n');
+    expect(stderr).toContain('{"calledBack":true,"returned":true}');
+    // A wrapper that returned nothing would give undefined here.
+    expect(kept(root)!.lines).toEqual(['info', 'warn', 'debug', 'around', 'with a callback', '{"calledBack":true,"returned":true}']);
+  });
+
   test('keeps only its last lines, from the end of what it wrote, and writes them at process.exit too', () => {
+    // The bounds the change promises: 40 lines, from at most 64 KiB.
+    expect([TRIAL_LOG_LINES, TRIAL_LOG_CHARS]).toEqual([40, 64 * 1024]);
     const root = install();
     const { status } = run(root, [
       `for (let i = 0; i < ${TRIAL_LOG_LINES + 10}; i++) console.log('line ' + i);`,
@@ -124,14 +145,27 @@ describe('a release on trial', () => {
 describe('a start that is no trial keeps nothing', () => {
   test('when no trial is under way', () => {
     const root = install(false);
-    run(root, "console.log('an ordinary start'); process.exit(1);");
+    const { status, stdout } = run(root, "console.log('an ordinary start'); process.exit(1);");
+    expect(status).toBe(1);
+    expect(stdout).toContain('an ordinary start');
     expect(existsSync(installPaths(root).trialLog)).toBe(false);
   });
 
   test('when the trial under way is another release', () => {
     const root = install(false);
     appendJournal(root, { at: '2026-10-24T01:00:00.000Z', step: 'trial-start', from: '0.12.1', to: '0.14.0', outcome: 'ok', mark: 'm2' });
-    run(root, "console.log('not the release on trial'); process.exit(1);");
+    const { status, stdout } = run(root, "console.log('not the release on trial'); process.exit(1);");
+    expect(status).toBe(1);
+    expect(stdout).toContain('not the release on trial');
+    expect(existsSync(installPaths(root).trialLog)).toBe(false);
+  });
+
+  test("when current already names the release on trial, as after a commit whose journal line wasn't written", () => {
+    const root = install();
+    moveCurrent(root, '0.13.0');
+    const { status, stdout } = run(root, "console.log('committed already'); process.exit(1);");
+    expect(status).toBe(1);
+    expect(stdout).toContain('committed already');
     expect(existsSync(installPaths(root).trialLog)).toBe(false);
   });
 

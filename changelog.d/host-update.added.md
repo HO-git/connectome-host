@@ -8,7 +8,7 @@
   children, then stops it for the service's next start to switch, on trial
   until the new release has opened its stores and connected its servers,
   going back by itself if it ends before that, and `/update` then shows the
-  last lines the new release wrote. `/update back` goes back
+  last lines the new release kept of what it wrote. `/update back` goes back
   afterwards, keeping the newer data or restoring the copy taken at the
   switch, and `bun <root>/start.js --go-back` asks for that from a shell when
   the new release keeps exiting.

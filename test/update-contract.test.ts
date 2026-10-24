@@ -11,7 +11,7 @@ import {
   ContractError, INSTALL_ROOT_ENV, JOURNAL_STEPS, PLACE_KINDS, RESTART_EXIT_CODE, SWITCH_QUIESCE_PREFIX, appendJournal, childrenFilePath,
   copyItemName, copyLabelPath, goBackListPath, installPaths, installRootFromEnv, itemSetAsideDir, lastCopy, markSpent,
   moveCurrent, pendingGoBack, readCurrent, realOrResolved, readGoBackList, readJournal, readMark, readRecord, releaseDir, setAsideDir,
-  trialPlaces, unfinishedTrial, writeJsonAtomic, writeMark, type CopyLabel, type GoBackList, type JournalLine, type Mark,
+  trialPlaces, unfinishedTrial, unsyncedText, writeJsonAtomic, writeMark, type CopyLabel, type GoBackList, type JournalLine, type Mark,
 } from '../src/update/contract.js';
 
 let root: string;
@@ -313,10 +313,11 @@ describe('the update contract', () => {
   });
 
   test('writing a mark asks for the request with a new id, synced, in place of any that stood', () => {
-    const first = writeMark(root, { to: '0.11.0', why: 'update' }, new Date('2026-10-22T12:00:00Z'));
+    const { mark: first, unsynced } = writeMark(root, { to: '0.11.0', why: 'update' }, new Date('2026-10-22T12:00:00Z'));
     expect(first).toEqual({ v: 1, id: expect.stringMatching(/^[0-9a-f-]{36}$/), to: '0.11.0', why: 'update', at: '2026-10-22T12:00:00.000Z' });
+    expect(unsynced).toBeNull();
     expect(readRecord(installPaths(root).mark, 'mark')).toEqual(first);
-    const second = writeMark(root, { to: '0.10.2', why: 'go-back', keepData: true });
+    const { mark: second } = writeMark(root, { to: '0.10.2', why: 'go-back', keepData: true });
     expect(second.id).not.toBe(first.id);
     expect(readRecord(installPaths(root).mark, 'mark')).toEqual({ ...second, keepData: true });
     expect(() => writeMark(root, { to: '../0.9.0', why: 'update' })).toThrow(ContractError);
@@ -324,15 +325,18 @@ describe('the update contract', () => {
 
   test("a mark whose write fails once it's in place still asks, and one that failed before leaves the mark that stood", () => {
     const { mark: path } = installPaths(root);
-    const standing = writeMark(root, { to: '0.11.0', why: 'update' });
+    const { mark: standing } = writeMark(root, { to: '0.11.0', why: 'update' });
     // Fails before its rename: the mark that stood stays, and the write throws.
     const early = (() => { throw new Error('ENOSPC'); }) as typeof writeJsonAtomic;
     expect(() => writeMark(root, { to: '0.10.2', why: 'go-back' }, new Date(), early)).toThrow('ENOSPC');
     expect(readRecord(path, 'mark')).toEqual(standing);
-    // Fails after its rename, as a directory sync that fails: the mark is in place, and asks.
+    // Fails after its rename, as a directory sync that fails: the mark is in place, and asks, with the failure.
     const late = ((at: string, value: unknown) => { writeJsonAtomic(at, value); throw new Error('EIO'); }) as typeof writeJsonAtomic;
     const written = writeMark(root, { to: '0.10.2', why: 'go-back' }, new Date(), late);
-    expect(readRecord(path, 'mark')).toEqual(written);
+    expect(readRecord(path, 'mark')).toEqual(written.mark);
+    expect(written.unsynced?.message).toBe('EIO');
+    expect(unsyncedText(written.unsynced!)).toBe('The request is written, though syncing it to the disk failed (EIO), so a power cut ' +
+      'could still undo it.');
     // A file it can't read isn't its mark, so the write's own error stands.
     const garbled = ((at: string) => { fs.writeFileSync(at, 'not json'); throw new Error('EIO'); }) as typeof writeJsonAtomic;
     expect(() => writeMark(root, { to: '0.10.2', why: 'go-back' }, new Date(), garbled)).toThrow('EIO');

@@ -6,8 +6,8 @@
  * what a trial that ends before its commit wrote.
  *
  * While a host runs on trial, armTrialLog keeps the end of what it writes
- * through console's methods and through process.stdout's and
- * process.stderr's write, each passed on unchanged. Bun's console writes to
+ * through console's log, info, warn, error and debug and through
+ * process.stdout's and process.stderr's write, each passed on unchanged. Bun's console writes to
  * the descriptors itself, past those write methods, so both are wrapped, and
  * a console call is kept as node:util's format renders its arguments, which
  * lays out an object on fewer lines than Bun's console does. What's kept is
@@ -18,8 +18,9 @@
  * (disarmTrialLog), so nothing is kept after, and the wraps only pass what's
  * written on, formatting and decoding nothing.
  *
- * What doesn't pass through those isn't kept: Bun's own report of an error
- * nothing caught, which its printer writes past console; everything, if a
+ * What doesn't pass through those isn't kept: console's other methods, such
+ * as dir, table and trace; Bun's own report of an error nothing caught,
+ * which its printer writes past console; everything, if a
  * signal ends the process, such as a stop's SIGTERM or the OOM killer's
  * SIGKILL, since a signal nothing handles runs no exit handler, and the
  * host's own handlers start only after the commit (headless.ts); what a start

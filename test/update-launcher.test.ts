@@ -2440,7 +2440,7 @@ describe('a refused request', () => {
       `Its mark couldn't be removed (EACCES), so the next start tries it again: remove ${installPaths(root).mark} to drop it.`);
   });
 
-  test("whose removal can't be synced says the mark could stand again after a power cut", async () => {
+  test("whose removal can't be synced says a power cut could bring the mark back", async () => {
     mark({ to: '0.11.0', why: 'update' });
     free = 1024;
     const realOpen = fs.openSync;
@@ -2460,8 +2460,8 @@ describe('a refused request', () => {
     expect(failed).toBe(true);
     expect(existsSync(installPaths(root).mark)).toBe(false);
     expect(reports.find((l) => l.includes("didn't go ahead"))).toContain('The request is dropped: once what refused it has ' +
-      'cleared, ask again with /update restart. Syncing its removal failed (EIO), so after a power cut the mark could stand ' +
-      'again, and the next start would try the request once more.');
+      'cleared, ask again with /update restart. Syncing its removal failed (EIO), so a power cut could bring the mark back, ' +
+      'for the next start to try the request once more.');
   });
 
   test('a refused Go back names the ways to ask for one again', async () => {
@@ -2571,6 +2571,7 @@ describe('a Go back from a shell', () => {
     expect(readRecord<{ v: 1; pid: number }>(installPaths(root).lock, 'lock')?.pid).toBe(4242);
     expect(reports[0]).toContain("Waiting up to 60 s for this install's host to give up its lock");
     expect(reports.at(-1)).toMatch(/^\[update\] Nothing was asked for: this install's lock has been held for the last 60 s\. Another start .* holds its lock .*`\/update back`/);
+    expect(reports.at(-1)).toEndWith('Otherwise stop the service, run this again, and start the service.');
   });
 
   test('takes the lock a host that keeps exiting gives up, writes the mark, gives the lock up, and the next start goes back', async () => {
@@ -2601,6 +2602,37 @@ describe('a Go back from a shell', () => {
     writeJsonAtomic(installPaths(root).mark, { v: 1, id: '../x', at: '2026-10-20T00:00:00Z', to: '0.12.0', why: 'update' });
     expect(goBackFromShell(root, [], ops())).toBe(0);
     expect(reports.at(-1)).toContain("This replaces the request to a release this release can't read that stood");
+  });
+
+  test("names a failed sync of the mark it wrote, which still stands", async () => {
+    await committedSwitch();
+    // The directory's sync fails, after the rename has put the mark in place.
+    const rename = fs.renameSync;
+    const fsync = fs.fsyncSync;
+    let renamed = false;
+    const spies = [
+      spyOn(fs, 'renameSync').mockImplementation((from: fs.PathLike, to: fs.PathLike) => {
+        rename(from, to);
+        if (String(to) === installPaths(root).mark) renamed = true;
+      }),
+      spyOn(fs, 'fsyncSync').mockImplementation((fd: number) => {
+        if (renamed && fs.fstatSync(fd).isDirectory()) {
+          renamed = false;
+          throw new Error('EIO: i/o error, fsync');
+        }
+        fsync(fd);
+      }),
+    ];
+    let code;
+    try {
+      code = goBackFromShell(root, [], ops());
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+    expect(code).toBe(0);
+    expect(readRecord<Mark>(installPaths(root).mark, 'mark')).toMatchObject({ to: '0.10.2', why: 'go-back' });
+    expect(reports.at(-1)).toEndWith('The request is written, though syncing it to the disk failed (EIO: i/o error, fsync), ' +
+      'so a power cut could still undo it.');
   });
 
   test("asks for nothing at once when the lock can't be taken for any reason but a running holder", () => {

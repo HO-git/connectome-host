@@ -27,7 +27,7 @@
  */
 import { readdirSync, readFileSync } from 'node:fs';
 import { bunBelowFloor } from '../bun-floor.js';
-import { installPaths, isSwitchQuiesce, readCurrent, readJournal, releaseDir, writeMark } from './contract.js';
+import { installPaths, isSwitchQuiesce, readCurrent, readJournal, releaseDir, unsyncedText, writeMark } from './contract.js';
 import type { ReleaseHere } from './host.js';
 import { EXACT_VERSION, hostProblem, installRelease, machineInstallOps, type InstallOps } from './install.js';
 import { goBackOffer } from './launcher.js';
@@ -299,14 +299,14 @@ export class HostUpdate {
 
   /** After a quiesce that didn't drain: wait up to 10 minutes more. */
   async waitLonger(): Promise<UpdateAnswer> {
-    if (this.restart?.phase !== 'busy') return refused('No restart is waiting on turns to end.');
+    if (this.restart?.phase !== 'busy') return refused(NO_WAIT_RAN_OUT);
     return this.quiesceThenStop(this.need().waits?.longerMs ?? WAIT_LONGER_MS);
   }
 
   /** After a quiesce that didn't drain: stop now, cutting off the turns
    *  still in progress. */
   async stopNow(): Promise<UpdateAnswer> {
-    if (this.restart?.phase !== 'busy') return refused('No restart is waiting on turns to end.');
+    if (this.restart?.phase !== 'busy') return refused(NO_WAIT_RAN_OUT);
     if (this.need().host.framework() !== this.quiescedFramework) return this.callOff(SESSION_CHANGED);
     return this.markAndStop();
   }
@@ -477,8 +477,9 @@ export class HostUpdate {
   private async markAndStop(): Promise<UpdateAnswer> {
     const setup = this.need();
     const restart = this.restart!;
+    let unsynced: Error | null;
     try {
-      writeMark(setup.here!.root, { to: restart.to, why: restart.why, keepData: restart.keepData }, this.now());
+      ({ unsynced } = writeMark(setup.here!.root, { to: restart.to, why: restart.why, keepData: restart.keepData }, this.now()));
     } catch (error) {
       return this.callOff(`its mark couldn't be written: ${said(error)}`);
     }
@@ -486,9 +487,10 @@ export class HostUpdate {
     restart.hosts = [];
     const stopper = this.stopper!;
     const going = restart.why === 'go-back' ? `go back to ${restart.to}` : `switch to ${restart.to}`;
-    const farewell = stopper.supervised
+    const farewell = (stopper.supervised
       ? `Stopping to ${going}: the host's next start does it, which a service set up for updates makes by itself.`
-      : `Stopping to ${going}: once it has stopped, start the host again, and that start does it.`;
+      : `Stopping to ${going}: once it has stopped, start the host again, and that start does it.`) +
+      (unsynced !== null ? ` ${unsyncedText(unsynced)}` : '');
     stopper.stop(`update: ${going}`, farewell);
     return done(farewell);
   }
@@ -539,9 +541,11 @@ const GO_BACK_UNREAD = 'whether a Go back is offered';
 
 const SESSION_CHANGED = 'the session changed while turns were ending, so this host now serves one the restart didn\'t ' +
   'quiesce. Ask again.';
-const RESUME_AGAIN = 'For a host still quiesced, /update restart resume tries again, and the host\'s next start ends the ' +
-  'switch\'s quiesce.';
+const RESUME_AGAIN = 'For a host still quiesced, /update restart resume tries again, as does the host\'s next start.';
 const ENDING_LEFT = 'A switch\'s quiesce is being ended. Ask again once that has answered.';
+/** Wait longer and stop now are for a restart whose wait has run out. */
+const NO_WAIT_RAN_OUT = 'No restart\'s wait for turns to end has run out, so there is nothing to wait longer for or ' +
+  'stop now.';
 
 /** What a restart is doing, in each phase but busy, which says more. */
 const PHASE: Record<Exclude<RestartState['phase'], 'busy'>, string> = {
