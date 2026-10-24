@@ -1,11 +1,13 @@
 - An Anthropic error record in llm-calls keeps the full request only for the
-  first failure of each kind of error (its type and HTTP status, or for an
-  untyped error its name) in a run of failures on its cache lineage (model,
-  system and tools); a call's success on that lineage, or an hour with no
-  failed call on it, ends the run, and keepalive pokes count for neither.
+  first failure of each kind of error (its type, or for an untyped error its
+  name, with its HTTP status when it has one) in a run of failures on its
+  cache lineage (model, system and tools); a call's success on that lineage,
+  or an hour with no failed call on it, ends the run, and keepalive pokes and
+  cancelled calls count for neither.
   The run's later failures of that kind, such as each retry or each turn of
   a rate-limit storm, record the request's size under `rawRequestOmitted`,
-  with the hash of the run's copy as `copySha256`, and each complete or
+  with the hash of the run's copy of that kind as `copySha256` once that
+  copy is written, and each complete or
   stream error record with a request carries `requestSha256`. The adapter
   remembers the runs of the 256 lineages whose runs began latest, and a log
   writes at most 64 MiB of such copies at once, refilled at 64 MiB a day:

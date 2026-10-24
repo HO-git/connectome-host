@@ -149,7 +149,8 @@ const FAILING_RUNS_REMEMBERED = 256;
  *  UTF-8 bytes, whatever else differs between them: a budget that refills
  *  at this much per FAILED_REQUEST_COPY_REFILL_MS, so a long-running
  *  process can still keep a fresh failure after routine ones have spent it,
- *  while the file's growth stays bounded per day. */
+ *  while what failing requests' copies add to the file stays bounded per
+ *  day. */
 const FAILED_REQUEST_COPY_BUDGET = 64 * 1024 * 1024;
 
 /** How long an empty budget for failing requests takes to refill whole. It
@@ -175,9 +176,10 @@ type Written = { lineage: string | undefined; kind: string; bytes: number; reque
  *  failed. */
 type FailingRun = { kinds: Map<string, string>; lastFailureAt: number };
 
-/** The kind of failure a run keeps one copy of: membrane's error type and
- *  the HTTP status, since membrane types every 5xx as `server` (a 500 can be
- *  an invalid request), or for an error without a type, its name. */
+/** The kind of failure a run keeps one copy of: membrane's error type, or
+ *  for an error without a type its name, with the HTTP status when there is
+ *  one, since membrane types every 5xx as `server` (a 500 can be an invalid
+ *  request). */
 function failureKind(fields: Record<string, unknown> | undefined): string {
   const name = (fields?.error as { name?: unknown } | undefined)?.name;
   const type = typeof fields?.errorType === 'string' ? fields.errorType : `untyped ${typeof name === 'string' ? name : ''}`;
@@ -610,8 +612,9 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       },
       // A poke replays a request derived from its lineage's latest one the
       // provider began answering, every refresh interval, so a row keeps it
-      // only with full payloads on, failed and refused pokes' rows included. A turn's refused row keeps its own, and
-      // so does its failed row when it's its run's first of its kind.
+      // only with full payloads on, failed and refused pokes' rows included.
+      // A turn's refused row keeps its own, and its failed row can keep its
+      // own as its run's first of its kind (errorRequestFields).
       rawRequest: this.fullPayloads ? raw : undefined,
       ...(response ? { rawResponse: response } : {}),
       ...errorFields,
@@ -758,8 +761,8 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     }
   }
 
-  /** The cache lineages (model, system and tools) failing since a turn on
-   *  them last succeeded, within FAILING_RUN_GAP_MS of their last failure,
+  /** The cache lineages (model, system and tools) failing since a call on
+   *  them, a turn or complete(), last succeeded, within FAILING_RUN_GAP_MS of their last failure,
    *  each with its run: the FAILING_RUNS_REMEMBERED whose runs began latest,
    *  oldest first, so the map can't grow with every lineage a long process
    *  meets. A storm repeats its lineage, not its request: membrane's retries
@@ -780,9 +783,10 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
    *  last copy written: one line per spell with no room, not one per record. */
   private budgetRefusalTold = false;
 
-  /** An error record's request fields. Whatever the error, the first failing
-   *  request of each kind (failureKind) in a lineage's run of failures is
-   *  kept whole, since any failure, a 429 included (see
+  /** An error record's request fields. Whatever the error, a cancelled call
+   *  apart, the first failing request of each kind (failureKind) in a
+   *  lineage's run of failures is kept whole, within the budget, since any
+   *  failure, a 429 included (see
    *  OAUTH_SYSTEM_IDENTITY), can be the request's doing, and a run's first
    *  failure of a kind is where its cause shows. The run's later failures of
    *  that kind, and any whose request the log's budget for failing requests
@@ -792,8 +796,8 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
    *  that copy's record's `requestSha256`), as a cancelled call (membrane's `abort`) always does, since a
    *  cancellation is never the request's doing; it leaves its lineage's run
    *  as it was. A request with no lineage is held to the budget alone. Each
-   *  record with a request carries `requestSha256`, so identical requests
-   *  show as such. `remember` is what to note once the record is appended
+   *  error record whose request can be serialized carries `requestSha256`,
+   *  so identical requests show as such. `remember` is what to note once the record is appended
    *  whole. LLM_CALLS_FULL_PAYLOADS=1 keeps every copy. */
   private errorRequestFields(rawRequest: unknown, lineage: string | undefined, kind: string, aborted: boolean): {
     fields: Record<string, unknown>;
@@ -820,8 +824,8 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     const run = lineage === undefined ? undefined : this.failingRun(lineage);
     const copySha256 = run?.kinds.get(kind);
     if (copySha256 !== undefined) {
-      const note = omitted('this lineage has failed with this kind of error (its type and HTTP status, or for an untyped '
-        + 'error its name) since a call on it last succeeded, with no hour between its failures, and an earlier error '
+      const note = omitted('this lineage has failed with this kind of error (its type, or for an untyped error its name, '
+        + 'with its HTTP status when it has one) since a call on it last succeeded, with no hour between its failures, and an earlier error '
         + 'record in this log, whose requestSha256 is copySha256, has the first such request in full, unless the file '
         + 'was rotated since');
       return { fields: { ...note.fields, rawRequestOmitted: { ...note.fields.rawRequestOmitted, copySha256 } } };
@@ -862,7 +866,9 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       : Math.min(this.failedCopyBudget,
         this.failedCopyRoom + (Math.max(0, now - this.failedCopyRefilledAt) * this.failedCopyBudget) / FAILED_REQUEST_COPY_REFILL_MS);
     this.failedCopyRoom = room;
-    this.failedCopyRefilledAt = now;
+    // Never moved back: a clock stepped back would otherwise credit the same
+    // stretch again once it came forward.
+    this.failedCopyRefilledAt = Math.max(this.failedCopyRefilledAt, now);
     return room;
   }
 
@@ -874,7 +880,8 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     try {
       console.error(`[llm-calls] ${new Date().toISOString()} the budget for failing requests in full `
         + `(${this.failedCopyBudget} bytes, refilled at that much a day) has no room: failing requests are recorded `
-        + 'by size and hash until it refills. LLM_CALLS_FULL_PAYLOADS=1, read when the host starts, keeps every copy.');
+        + 'by size and hash until it refills. LLM_CALLS_FULL_PAYLOADS=1, read when the host starts, keeps every copy '
+        + '(within the 16 MiB line bound).');
     } catch { /* never throw from logging */ }
   }
 

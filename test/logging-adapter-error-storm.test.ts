@@ -1,6 +1,6 @@
 /**
  * An error record keeps the full request for the first failure of each kind
- * (error type and HTTP status, or an untyped error's name) in a cache lineage's run of failures, within a
+ * (error type, or an untyped error's name, with any HTTP status) in a cache lineage's run of failures, within a
  * budget per log; the run's later failures of that kind (each retry, each
  * turn of a storm) record the request's hash and size instead.
  */
@@ -110,7 +110,7 @@ test('a storm across turns is one run: each turn adds a message, and only the fi
   for (const [n, rec] of records.slice(1).entries()) {
     expect(rec.rawRequest).toBeUndefined();
     expect(rec.requestSha256).toBe(sha(turns[n + 1]));
-    expect(rec.rawRequestOmitted).toMatchObject({ reason: expect.stringContaining('failed with this kind of error (its type and HTTP status, or for an untyped error its name) since a call on it last succeeded, with no hour between its failures') });
+    expect(rec.rawRequestOmitted).toMatchObject({ reason: expect.stringContaining('failed with this kind of error (its type, or for an untyped error its name, with its HTTP status when it has one) since a call on it last succeeded, with no hour between its failures') });
   }
   // One copy of a ~200 KB request, and nineteen notes.
   expect(readFileSync(logPath).length).toBeLessThan(2 * JSON.stringify(BIG).length);
@@ -137,7 +137,7 @@ test('within a run, the first failure of each kind is kept whole', async () => {
   expect(kept).toEqual([true, false, true, false, true, false, false]);
 });
 
-test('a kind is the error type with its HTTP status, or an untyped error\'s name', async () => {
+test('a kind is the error type, or an untyped error\'s name, with its HTTP status when it has one', async () => {
   const adapter = newAdapter();
   const kept: boolean[] = [];
   // membrane types every 5xx as server: a 500 after 529s is another kind. Two
@@ -150,7 +150,7 @@ test('a kind is the error type with its HTTP status, or an untyped error\'s name
   expect(kept).toEqual([true, false, true, true, true, true, true, false]);
 });
 
-test('a run ends an hour after its last failed call, and a failure within the hour keeps it going', async () => {
+test('a run ends once more than an hour has passed since its last failed call, and a failure within the hour keeps it going', async () => {
   const adapter = newAdapter();
   // bun's system time stands still once set, so each failure happens at `now`.
   let now = Date.parse('2026-10-21T09:00:00Z');
@@ -300,10 +300,10 @@ test('LLM_CALLS_FULL_PAYLOADS=1 keeps every copy', async () => {
 });
 
 /** Make the underlying adapter capture `raw`, then answer. */
-function answerWith(raw: unknown): void {
+function answerWith(raw: unknown, stopReason = 'end_turn'): void {
   const ok = async (_req: unknown, a?: unknown, b?: unknown) => {
     ((b ?? a) as { onRequest?: (r: unknown) => void } | undefined)?.onRequest?.(raw);
-    return { content: [], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, raw: { stop_reason: 'end_turn' } };
+    return { content: [], stopReason, usage: { inputTokens: 1, outputTokens: 1 }, raw: { stop_reason: stopReason } };
   };
   proto.complete = ok;
   proto.stream = ok;
@@ -399,6 +399,9 @@ test("a cancelled call keeps no copy and leaves its lineage's run as it was", as
     expect(cancelled.rawRequestOmitted).toMatchObject({ reason: expect.stringContaining('never the request') });
     // The cancellation began no run: the lineage's first failure is kept.
     expect((await call(rateLimitError('429'), '09:01')).rawRequest).toEqual(ofLineage('a', '09:01'));
+    // Nor does one end a run going on: the next 429 is its repeat.
+    expect((await call(abortError('Request was aborted'), '09:02')).rawRequest).toBeUndefined();
+    expect((await call(rateLimitError('429'), '09:03')).rawRequestOmitted).toMatchObject({ copySha256: sha(ofLineage('a', '09:01')) });
     // A cancellation 50 minutes on doesn't carry the run on: an hour after
     // its last failure, the run has ended, and the next failure is kept.
     now += 50 * 60_000;
@@ -425,4 +428,102 @@ test("a repeat's note names its run's copy of that kind by hash, which is that c
   expect(limitNote.rawRequestOmitted).toMatchObject({ copySha256: firstLimit.requestSha256 });
   expect(overloadNote.rawRequestOmitted).toMatchObject({ copySha256: firstOverload.requestSha256 });
   expect((limitNote.rawRequestOmitted as { reason: string }).reason).toContain('copySha256');
+});
+
+test("LLM_CALLS_FULL_PAYLOADS=1 keeps a cancelled call's request too", async () => {
+  process.env.LLM_CALLS_FULL_PAYLOADS = '1';
+  failWith(abortError('Request was aborted'), ofLineage('a'));
+  const [rec] = await errorRecords('stream', 1);
+  expect(rec.rawRequest).toEqual(ofLineage('a'));
+  expect(rec.rawRequestOmitted).toBeUndefined();
+});
+
+test("a refusal's request, kept on a call that got a response, isn't charged to the budget for failing requests", async () => {
+  const adapter = newAdapter();
+  const size = Buffer.byteLength(JSON.stringify(ofLineage('a', 'x'.repeat(1000))), 'utf8');
+  (adapter as unknown as { failedCopyBudget: number }).failedCopyBudget = size + 10;
+  answerWith(ofLineage('b', 'x'.repeat(1000)), 'refusal');
+  await adapter.complete({ model: 'claude-fable-5', messages: [] } as never);
+  const refusal = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).find((r) => r.type === 'call')!;
+  expect(refusal.rawRequest).toEqual(ofLineage('b', 'x'.repeat(1000)));
+  failWith(rateLimitError('429'), ofLineage('a', 'x'.repeat(1000)));
+  expect((await errorRecords('stream', 1, adapter)).at(-1)!.rawRequest).toEqual(ofLineage('a', 'x'.repeat(1000)));
+});
+
+test('however long the budget sits, it refills only to its whole', async () => {
+  const adapter = newAdapter();
+  const size = Buffer.byteLength(JSON.stringify(ofLineage('a', 'x'.repeat(1000))), 'utf8');
+  (adapter as unknown as { failedCopyBudget: number }).failedCopyBudget = 2 * size;
+  let now = Date.parse('2026-10-24T09:00:00Z');
+  const keep = async (name: string) => {
+    setSystemTime(new Date(now));
+    failWith(rateLimitError('429'), ofLineage(name, 'x'.repeat(1000)));
+    return (await errorRecords('stream', 1, adapter)).at(-1)!.rawRequest !== undefined;
+  };
+  try {
+    await stderrOf(async () => {
+      expect([await keep('a'), await keep('b'), await keep('c')]).toEqual([true, true, false]);
+      // Two days later: room for two copies, not four.
+      now += 2 * 24 * 60 * 60 * 1000;
+      expect([await keep('d'), await keep('e'), await keep('f')]).toEqual([true, true, false]);
+    });
+  } finally {
+    setSystemTime();
+  }
+});
+
+test('a clock stepped back and forward again refills the stretch between once', async () => {
+  const adapter = newAdapter();
+  const size = Buffer.byteLength(JSON.stringify(ofLineage('a', 'x'.repeat(1000))), 'utf8');
+  (adapter as unknown as { failedCopyBudget: number }).failedCopyBudget = 2 * size;
+  let now = Date.parse('2026-10-24T09:00:00Z');
+  const keep = async (name: string) => {
+    setSystemTime(new Date(now));
+    failWith(rateLimitError('429'), ofLineage(name, 'x'.repeat(1000)));
+    return (await errorRecords('stream', 1, adapter)).at(-1)!.rawRequest !== undefined;
+  };
+  try {
+    await stderrOf(async () => {
+      expect([await keep('a'), await keep('b')]).toEqual([true, true]);
+      // Eight hours on, two thirds of a copy have refilled: no room yet.
+      now += 8 * 60 * 60 * 1000;
+      expect(await keep('c')).toBe(false);
+      // The clock steps back eight hours, then comes forward to where it was:
+      // nothing more has refilled.
+      now -= 8 * 60 * 60 * 1000;
+      expect(await keep('d')).toBe(false);
+      now += 8 * 60 * 60 * 1000;
+      expect(await keep('e')).toBe(false);
+    });
+  } finally {
+    setSystemTime();
+  }
+});
+
+test("a repeat while the budget has no room is noted as its run's repeat, naming its copy, with no stderr line", async () => {
+  const adapter = newAdapter();
+  const size = Buffer.byteLength(JSON.stringify(ofLineage('a', 'x'.repeat(1000))), 'utf8');
+  (adapter as unknown as { failedCopyBudget: number }).failedCopyBudget = size;
+  const told = await stderrOf(async () => {
+    failWith(rateLimitError('429'), ofLineage('a', 'x'.repeat(1000)));
+    const first = (await errorRecords('stream', 1, adapter)).at(-1)!;
+    expect(first.rawRequest).toBeDefined();
+    failWith(rateLimitError('429'), ofLineage('a', 'y'.repeat(1000)));
+    const repeat = (await errorRecords('stream', 1, adapter)).at(-1)!;
+    expect(repeat.rawRequestOmitted).toMatchObject({ copySha256: first.requestSha256 });
+  });
+  expect(told.filter((l) => l.includes('the budget for failing requests'))).toHaveLength(0);
+});
+
+test("an error whose request can't be serialized keeps its summary and error, without the request or a hash", async () => {
+  const adapter = newAdapter();
+  const raw = { model: 'claude-fable-5', system: [{ type: 'text', text: 'a' }], messages: [{ role: 'user', content: 'x' }], extra: 10n };
+  failWith(rateLimitError('429'), raw);
+  const rec = (await errorRecords('stream', 1, adapter)).at(-1)!;
+  expect(rec.summaryUnavailable).toBeUndefined();
+  expect(rec.requestSummary).toMatchObject({ model: 'claude-fable-5' });
+  expect(rec.errorType).toBe('rate_limit');
+  expect(rec.rawRequest).toBeUndefined();
+  expect(rec.requestSha256).toBeUndefined();
+  expect(rec.truncated).toBe('raw bodies dropped (they could not be serialized)');
 });
